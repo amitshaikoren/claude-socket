@@ -1,0 +1,5 @@
+node_modules/
+workspaces/
+bridge.config.json
+.env
+*.log

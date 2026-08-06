@@ -1,0 +1,27 @@
+{
+  "name": "claude-bridge",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "An OpenAI/Anthropic-compatible API server that looks like a locally hosted LLM and is actually the Claude Code CLI.",
+  "engines": {
+    "node": ">=24.0.0"
+  },
+  "bin": {
+    "claude-bridge": "./src/index.ts",
+    "claude-bridge-cli": "./src/cli.ts"
+  },
+  "scripts": {
+    "start": "node src/index.ts",
+    "dev": "node --watch src/index.ts",
+    "cli": "node src/cli.ts",
+    "watch": "node src/cli.ts watch",
+    "chat": "node src/cli.ts chat",
+    "typecheck": "tsc --noEmit",
+    "test": "node --test test/*.test.ts"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "typescript": "^5.7.0"
+  }
+}

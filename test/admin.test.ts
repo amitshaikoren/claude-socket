@@ -1,0 +1,122 @@
+import { test, describe, before, after } from "node:test";
+import assert from "node:assert/strict";
+import { startTestServer, authHeaders, type TestServer } from "./helpers.ts";
+import { telemetry } from "../src/core/telemetry.ts";
+
+describe("dashboard and admin API", () => {
+  let server: TestServer;
+
+  before(async () => {
+    telemetry.reset();
+    server = await startTestServer();
+  });
+  after(async () => {
+    await server.close();
+  });
+
+  const chat = (content: string) =>
+    fetch(`${server.base}/v1/chat/completions`, {
+      method: "POST",
+      headers: authHeaders(),
+      body: JSON.stringify({ model: "oracle", messages: [{ role: "user", content }] }),
+    });
+
+  test("serves the dashboard shell without a token", async () => {
+    const res = await fetch(`${server.base}/ui`);
+    assert.equal(res.status, 200);
+    assert.match(res.headers.get("content-type") ?? "", /text\/html/);
+    const html = await res.text();
+    assert.match(html, /claude-bridge/);
+    assert.match(html, /admin\/events/);
+  });
+
+  test("stats require a token", async () => {
+    assert.equal((await fetch(`${server.base}/admin/stats`)).status, 401);
+  });
+
+  test("accepts the token as a query parameter, for EventSource", async () => {
+    const res = await fetch(`${server.base}/admin/stats?api_key=test-token`);
+    assert.equal(res.status, 200);
+  });
+
+  test("totals accumulate across turns", async () => {
+    await chat("first telemetry probe");
+    await chat("second telemetry probe");
+
+    const stats = (await (await fetch(`${server.base}/admin/stats`, { headers: authHeaders() })).json()) as any;
+    assert.ok(stats.totals.requests >= 2);
+    assert.ok(stats.totals.turns >= 2);
+    assert.ok(stats.totals.outputTokens > 0);
+    assert.equal(stats.config.defaultMode, "oracle");
+    assert.ok(Array.isArray(stats.sessions));
+  });
+
+  test("the event feed replays history and then streams live", async () => {
+    const res = await fetch(`${server.base}/admin/events?history=50`, { headers: authHeaders() });
+    assert.equal(res.status, 200);
+    assert.match(res.headers.get("content-type") ?? "", /event-stream/);
+
+    const reader = res.body!.getReader();
+    const decoder = new TextDecoder();
+    let buffer = "";
+    const events: any[] = [];
+
+    // Drain the replayed history, then trigger a fresh turn and watch it arrive.
+    const readSome = async (until: (list: any[]) => boolean, budgetMs: number) => {
+      const deadline = Date.now() + budgetMs;
+      while (Date.now() < deadline && !until(events)) {
+        const chunk = await Promise.race([
+          reader.read(),
+          new Promise<{ done: true; value: undefined }>((r) =>
+            setTimeout(() => r({ done: true, value: undefined }), 500),
+          ),
+        ]);
+        if (!chunk.value) continue;
+        buffer += decoder.decode(chunk.value, { stream: true });
+        let split: number;
+        while ((split = buffer.indexOf("\n\n")) >= 0) {
+          const frame = buffer.slice(0, split);
+          buffer = buffer.slice(split + 2);
+          const line = frame.split("\n").find((l) => l.startsWith("data: "));
+          if (line) events.push(JSON.parse(line.slice(6)));
+        }
+      }
+    };
+
+    await readSome((list) => list.length > 0, 3000);
+    assert.ok(events.length > 0, "history was replayed");
+
+    const before = events.length;
+    await chat("live feed probe");
+    await readSome((list) => list.length > before, 5000);
+
+    const live = events.slice(before);
+    assert.ok(live.some((e) => e.type === "request" || e.type === "turn"), "a live event arrived");
+
+    await reader.cancel();
+  });
+
+  test("a session can be killed by id", async () => {
+    await chat("session to be killed");
+    const listed = (await (await fetch(`${server.base}/admin/sessions`, { headers: authHeaders() })).json()) as any;
+    const target = listed.sessions[0];
+    assert.ok(target?.sessionId);
+
+    const killed = await fetch(`${server.base}/admin/sessions/${target.sessionId}`, {
+      method: "DELETE",
+      headers: authHeaders(),
+    });
+    assert.equal(killed.status, 200);
+
+    const after = (await (await fetch(`${server.base}/admin/sessions`, { headers: authHeaders() })).json()) as any;
+    assert.ok(!after.sessions.some((s: any) => s.sessionId === target.sessionId));
+
+    assert.equal(
+      (await fetch(`${server.base}/admin/sessions/${target.sessionId}`, {
+        method: "DELETE",
+        headers: authHeaders(),
+      })).status,
+      404,
+    );
+  });
+});

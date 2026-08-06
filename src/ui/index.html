@@ -1,0 +1,283 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>claude-bridge</title>
+<style>
+  :root {
+    color-scheme: dark;
+    --bg: #0c0d10;
+    --panel: #14161b;
+    --panel-2: #1a1d24;
+    --line: #262a33;
+    --text: #e6e8ec;
+    --dim: #878d9a;
+    --accent: #d97757;
+    --green: #62b57a;
+    --blue: #6ba7d9;
+    --purple: #a98bd4;
+    --red: #d96b6b;
+    --mono: ui-monospace, "SF Mono", "Cascadia Mono", Menlo, Consolas, monospace;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font: 14px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif;
+  }
+  header {
+    display: flex; align-items: center; gap: 16px; flex-wrap: wrap;
+    padding: 14px 20px; border-bottom: 1px solid var(--line); background: var(--panel);
+    position: sticky; top: 0; z-index: 10;
+  }
+  h1 { font-size: 15px; margin: 0; font-weight: 600; letter-spacing: .2px; }
+  h1 span { color: var(--accent); }
+  .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--red); display: inline-block; }
+  .dot.live { background: var(--green); box-shadow: 0 0 8px var(--green); }
+  .spacer { flex: 1; }
+  input[type=password], input[type=text] {
+    background: var(--panel-2); border: 1px solid var(--line); color: var(--text);
+    border-radius: 6px; padding: 6px 10px; font: 12px var(--mono); width: 240px;
+  }
+  button {
+    background: var(--panel-2); border: 1px solid var(--line); color: var(--text);
+    border-radius: 6px; padding: 6px 12px; cursor: pointer; font-size: 12px;
+  }
+  button:hover { border-color: var(--accent); color: var(--accent); }
+  main { padding: 20px; display: grid; gap: 20px; grid-template-columns: minmax(0, 1fr); }
+  @media (min-width: 1100px) { main { grid-template-columns: minmax(0, 420px) minmax(0, 1fr); } }
+  .card { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; overflow: hidden; }
+  .card > h2 {
+    margin: 0; padding: 11px 16px; font-size: 12px; text-transform: uppercase;
+    letter-spacing: .08em; color: var(--dim); border-bottom: 1px solid var(--line);
+    display: flex; align-items: center; gap: 8px;
+  }
+  .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(110px, 1fr)); gap: 1px; background: var(--line); }
+  .stat { background: var(--panel); padding: 12px 16px; }
+  .stat .v { font: 600 20px/1.2 var(--mono); }
+  .stat .k { font-size: 11px; color: var(--dim); margin-top: 2px; }
+  .stat.cost .v { color: var(--accent); }
+  .stat.saved .v { color: var(--green); }
+  table { width: 100%; border-collapse: collapse; font-size: 12px; }
+  th { text-align: left; font-weight: 500; color: var(--dim); padding: 8px 16px; font-size: 11px; }
+  td { padding: 8px 16px; border-top: 1px solid var(--line); font-family: var(--mono); }
+  td.wrap { font-family: inherit; }
+  tr:hover td { background: var(--panel-2); }
+  .tag { display: inline-block; padding: 1px 7px; border-radius: 999px; font-size: 10px;
+         font-family: var(--mono); border: 1px solid; }
+  .tag.oracle { color: var(--blue); border-color: color-mix(in srgb, var(--blue) 40%, transparent); }
+  .tag.harness { color: var(--purple); border-color: color-mix(in srgb, var(--purple) 40%, transparent); }
+  .tag.busy { color: var(--accent); border-color: color-mix(in srgb, var(--accent) 40%, transparent); }
+  .kill { color: var(--dim); cursor: pointer; border: none; background: none; padding: 0 4px; }
+  .kill:hover { color: var(--red); }
+  #feed { max-height: 62vh; overflow-y: auto; font-family: var(--mono); font-size: 12px; }
+  .ev { padding: 7px 16px; border-top: 1px solid var(--line); display: flex; gap: 10px; align-items: baseline; }
+  .ev:first-child { border-top: none; }
+  .ev .t { color: var(--dim); font-size: 11px; flex-shrink: 0; }
+  .ev .type { flex-shrink: 0; width: 62px; font-size: 11px; }
+  .ev .body { min-width: 0; word-break: break-word; }
+  .ev.turn .type { color: var(--green); }
+  .ev.request .type { color: var(--blue); }
+  .ev.tool .type { color: var(--purple); }
+  .ev.session .type { color: var(--dim); }
+  .ev.error .type { color: var(--red); }
+  .ev .meta { color: var(--dim); }
+  .ev .q { color: var(--text); }
+  .ev .a { color: var(--green); }
+  .empty { padding: 24px 16px; color: var(--dim); font-size: 13px; text-align: center; }
+</style>
+</head>
+<body>
+<header>
+  <span class="dot" id="dot"></span>
+  <h1>claude<span>-bridge</span></h1>
+  <span class="meta" id="mode" style="color:var(--dim);font:12px var(--mono)"></span>
+  <span class="spacer"></span>
+  <input type="password" id="token" placeholder="API token" autocomplete="off" />
+  <button id="connect">Connect</button>
+  <button id="clear">Clear feed</button>
+</header>
+
+<main>
+  <div style="display:flex;flex-direction:column;gap:20px;min-width:0">
+    <div class="card">
+      <h2>Totals</h2>
+      <div class="stats" id="stats"></div>
+    </div>
+    <div class="card">
+      <h2>Live sessions <span id="sesscount" style="color:var(--dim)"></span></h2>
+      <div id="sessions"><div class="empty">none</div></div>
+    </div>
+  </div>
+
+  <div class="card" style="min-width:0">
+    <h2>Activity</h2>
+    <div id="feed"><div class="empty">Enter your API token and connect.</div></div>
+  </div>
+</main>
+
+<script>
+(() => {
+  const $ = (id) => document.getElementById(id);
+  const store = window.localStorage;
+  const tokenInput = $("token");
+  tokenInput.value = store.getItem("bridge-token") || "";
+
+  let source = null;
+  let poller = null;
+
+  const fmt = {
+    num: (n) => (n ?? 0).toLocaleString(),
+    usd: (n) => "$" + (n ?? 0).toFixed(4),
+    time: (ms) => new Date(ms).toLocaleTimeString([], { hour12: false }),
+    dur: (ms) => {
+      const s = Math.round(ms / 1000);
+      if (s < 60) return s + "s";
+      if (s < 3600) return Math.floor(s / 60) + "m " + (s % 60) + "s";
+      return Math.floor(s / 3600) + "h " + Math.floor((s % 3600) / 60) + "m";
+    },
+  };
+
+  const esc = (s) => String(s ?? "").replace(/[<>&]/g, (c) => ({ "<": "&lt;", ">": "&gt;", "&": "&amp;" }[c]));
+
+  const auth = () => "api_key=" + encodeURIComponent(tokenInput.value.trim());
+
+  async function api(path, options = {}) {
+    const sep = path.includes("?") ? "&" : "?";
+    const res = await fetch(path + sep + auth(), options);
+    if (!res.ok) throw new Error(path + " -> " + res.status);
+    return res.json();
+  }
+
+  function renderStats(data) {
+    const t = data.totals;
+    // Cache reads are history the client resent that we did not re-bill at full
+    // price -- the clearest single number for "the reuse is working".
+    const cards = [
+      ["Requests", fmt.num(t.requests), ""],
+      ["Turns", fmt.num(t.turns), ""],
+      ["Input tok", fmt.num(t.inputTokens), ""],
+      ["Output tok", fmt.num(t.outputTokens), ""],
+      ["Cached tok", fmt.num(t.cacheReadTokens), "saved"],
+      ["Tool calls", fmt.num(t.toolCalls), ""],
+      ["Errors", fmt.num(t.errors), ""],
+      ["Cost", fmt.usd(t.costUsd), "cost"],
+      ["Uptime", fmt.dur(data.uptimeMs), ""],
+    ];
+    $("stats").innerHTML = cards
+      .map(([k, v, cls]) => `<div class="stat ${cls}"><div class="v">${v}</div><div class="k">${k}</div></div>`)
+      .join("");
+
+    const c = data.config;
+    $("mode").textContent = `default ${c.defaultMode} · ${c.defaultModel} · reuse ${c.reuse ? "on" : "off"}`;
+  }
+
+  function renderSessions(list) {
+    $("sesscount").textContent = list.length ? `(${list.length})` : "";
+    if (!list.length) {
+      $("sessions").innerHTML = '<div class="empty">none</div>';
+      return;
+    }
+    const rows = list.map((s) => `
+      <tr>
+        <td title="${esc(s.sessionId)}">${esc((s.sessionId || "").slice(0, 8))}</td>
+        <td><span class="tag ${s.mode}">${s.mode}</span></td>
+        <td>${s.turns}</td>
+        <td>${fmt.usd(s.costUsd)}</td>
+        <td>${s.busy ? '<span class="tag busy">busy</span>' : s.idleSeconds + "s"}</td>
+        <td><button class="kill" data-id="${esc(s.sessionId)}" title="Terminate">✕</button></td>
+      </tr>`).join("");
+    $("sessions").innerHTML =
+      `<table><thead><tr><th>id</th><th>mode</th><th>turns</th><th>cost</th><th>idle</th><th></th></tr></thead><tbody>${rows}</tbody></table>`;
+
+    for (const btn of $("sessions").querySelectorAll(".kill")) {
+      btn.onclick = async () => {
+        try {
+          await api("/admin/sessions/" + encodeURIComponent(btn.dataset.id), { method: "DELETE" });
+          refresh();
+        } catch (err) { console.error(err); }
+      };
+    }
+  }
+
+  function line(ev) {
+    const body = (() => {
+      switch (ev.type) {
+        case "request":
+          return `<span class="meta">${esc(ev.model || "-")} ${ev.stream ? "stream" : "sync"}${ev.tools ? " tools:" + ev.tools : ""}</span>`;
+        case "turn":
+          return `<span class="q">${esc(ev.prompt)}</span> <span class="meta">→</span> <span class="a">${esc(ev.reply)}</span>` +
+            `<div class="meta">${ev.mode} · in ${fmt.num(ev.inputTokens)}` +
+            (ev.cacheReadTokens ? ` (+${fmt.num(ev.cacheReadTokens)} cached)` : "") +
+            ` · out ${fmt.num(ev.outputTokens)} · ${fmt.usd(ev.costUsd)}` +
+            (ev.toolCalls ? ` · ${ev.toolCalls} tool call(s)` : "") + `</div>`;
+        case "tool":
+          return `<span class="meta">${esc(ev.summary || ev.name)}</span>`;
+        case "session":
+          return `<span class="meta">${ev.action} ${esc((ev.sessionId || "").slice(0, 8))} ${ev.mode || ""} ${ev.reason ? "(" + ev.reason + ")" : ""}</span>`;
+        case "error":
+          return `<span style="color:var(--red)">${esc(ev.message || ev.errorType || "error")}</span>`;
+        default:
+          return "";
+      }
+    })();
+
+    const el = document.createElement("div");
+    el.className = "ev " + ev.type;
+    el.innerHTML = `<span class="t">${fmt.time(ev.at)}</span><span class="type">${ev.type}</span><span class="body">${body}</span>`;
+    return el;
+  }
+
+  function push(ev) {
+    const feed = $("feed");
+    if (feed.querySelector(".empty")) feed.innerHTML = "";
+    const atBottom = feed.scrollHeight - feed.scrollTop - feed.clientHeight < 60;
+    feed.appendChild(line(ev));
+    while (feed.children.length > 400) feed.removeChild(feed.firstChild);
+    if (atBottom) feed.scrollTop = feed.scrollHeight;
+    if (ev.type === "turn" || ev.type === "session") refresh();
+  }
+
+  let refreshQueued = false;
+  async function refresh() {
+    if (refreshQueued) return;
+    refreshQueued = true;
+    setTimeout(async () => {
+      refreshQueued = false;
+      try {
+        const data = await api("/admin/stats");
+        renderStats(data);
+        renderSessions(data.sessions);
+        $("dot").classList.add("live");
+      } catch {
+        $("dot").classList.remove("live");
+      }
+    }, 120);
+  }
+
+  function connect() {
+    const token = tokenInput.value.trim();
+    if (!token) return;
+    store.setItem("bridge-token", token);
+
+    if (source) source.close();
+    if (poller) clearInterval(poller);
+
+    // EventSource cannot set headers, hence the query-parameter credential.
+    source = new EventSource("/admin/events?history=60&" + auth());
+    source.onmessage = (e) => { try { push(JSON.parse(e.data)); } catch {} };
+    source.onopen = () => $("dot").classList.add("live");
+    source.onerror = () => $("dot").classList.remove("live");
+
+    refresh();
+    poller = setInterval(refresh, 5000);
+  }
+
+  $("connect").onclick = connect;
+  $("clear").onclick = () => { $("feed").innerHTML = '<div class="empty">cleared</div>'; };
+  tokenInput.onkeydown = (e) => { if (e.key === "Enter") connect(); };
+  if (tokenInput.value) connect();
+})();
+</script>
+</body>
+</html>

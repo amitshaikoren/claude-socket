@@ -1,0 +1,66 @@
+{
+  "server": { "host": "127.0.0.1", "port": 8787 },
+
+  "auth": {
+    "tokens": ["replace-me-with-a-long-random-string"],
+    "required": true
+  },
+
+  "claude": {
+    "binary": "claude",
+    "binaryArgs": [],
+    "extraArgs": [],
+    "env": {}
+  },
+
+  "defaults": { "mode": "oracle", "model": "claude-sonnet-5", "effort": null },
+
+  "oracle": {
+    "systemPrompt": "You are a helpful assistant.",
+    "settingSources": "",
+    "disableNonEssentialModelCalls": true
+  },
+
+  "harness": {
+    "workspaceRoot": "./workspaces",
+    "allowedCwds": [],
+    "permissionMode": "acceptEdits",
+    "tools": null,
+    "allowedTools": [],
+    "disallowedTools": [],
+    "dangerouslySkipPermissions": false,
+    "appendSystemPrompt": null,
+    "settingSources": "user,project,local",
+    "activity": "reasoning",
+    "disableNonEssentialModelCalls": true
+  },
+
+  "sessions": {
+    "max": 16,
+    "idleMs": 900000,
+    "reuse": true,
+    "turnTimeoutMs": 1200000
+  },
+
+  "logLevel": "info",
+
+  "_models_comment": "Optional. Omit to use the default catalog. Rename 'id' freely: it is what clients see, while 'model' is what the CLI is told.",
+  "_models_example": [
+    {
+      "id": "hermes-70b-local",
+      "model": "claude-sonnet-5",
+      "mode": "oracle",
+      "effort": null,
+      "contextWindow": 128000,
+      "ownedBy": "local-inference"
+    },
+    {
+      "id": "hermes-70b-agent",
+      "model": "claude-opus-5",
+      "mode": "harness",
+      "effort": "high",
+      "contextWindow": 500000,
+      "ownedBy": "local-inference"
+    }
+  ]
+}
