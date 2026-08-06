@@ -45,6 +45,14 @@ export interface Config {
     disableNonEssentialModelCalls: boolean;
   };
   sessions: { max: number; idleMs: number; reuse: boolean; turnTimeoutMs: number };
+  dashboard: {
+    /**
+     * Hand the configured API tokens to a dashboard loaded from loopback, so a
+     * local operator does not have to copy one out of the terminal. Never
+     * applies to a remote or proxied request.
+     */
+    localAutoAuth: boolean;
+  };
   models: ModelEntry[];
   logLevel: LogLevel;
 }
@@ -122,6 +130,7 @@ export function defaultConfig(): Config {
       disableNonEssentialModelCalls: true,
     },
     sessions: { max: 16, idleMs: 15 * 60_000, reuse: true, turnTimeoutMs: 20 * 60_000 },
+    dashboard: { localAutoAuth: true },
     models: defaultModels(defaults),
     logLevel: "info",
   };

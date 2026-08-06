@@ -76,6 +76,22 @@ export function createBridgeServer(cfg: Config, sessions: SessionManager): Serve
   return server;
 }
 
+/**
+ * True only for a request that physically arrived on the loopback interface and
+ * was not relayed. A proxy hop would otherwise make every remote request look
+ * local, which would turn token disclosure into a credential leak.
+ */
+function isLocalRequest(req: IncomingMessage): boolean {
+  const address = req.socket.remoteAddress ?? "";
+  const loopback =
+    address === "::1" || address === "::ffff:127.0.0.1" || address.startsWith("127.");
+  const relayed =
+    req.headers["x-forwarded-for"] !== undefined ||
+    req.headers["x-real-ip"] !== undefined ||
+    req.headers["forwarded"] !== undefined;
+  return loopback && !relayed;
+}
+
 /** Live activity feed for the dashboard and the `watch` CLI. */
 function streamEvents(res: ServerResponse, history: number): void {
   const sse = new SseWriter(res);
@@ -143,6 +159,21 @@ async function handle(
     // does require one.
     if (req.method === "GET" && (path === "/" || path === "/ui")) {
       serveDashboard(res);
+      return;
+    }
+
+    // Lets a dashboard opened on this machine authenticate itself instead of
+    // asking the operator to paste a key that is already printed on their
+    // terminal. Tokens are disclosed only to a direct loopback request.
+    if (req.method === "GET" && path === "/admin/bootstrap") {
+      const local = isLocalRequest(req) && cfg.dashboard.localAutoAuth;
+      sendJson(res, 200, {
+        authRequired: cfg.auth.required,
+        local,
+        tokens: !cfg.auth.required ? [] : local ? cfg.auth.tokens : [],
+        defaultMode: cfg.defaults.mode,
+        defaultModel: cfg.defaults.model,
+      });
       return;
     }
 

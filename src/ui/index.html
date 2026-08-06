@@ -35,10 +35,14 @@
   .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--red); display: inline-block; }
   .dot.live { background: var(--green); box-shadow: 0 0 8px var(--green); }
   .spacer { flex: 1; }
-  input[type=password], input[type=text] {
+  input[type=password], input[type=text], select {
     background: var(--panel-2); border: 1px solid var(--line); color: var(--text);
-    border-radius: 6px; padding: 6px 10px; font: 12px var(--mono); width: 240px;
+    border-radius: 6px; padding: 6px 10px; font: 12px var(--mono); max-width: 340px;
   }
+  input[type=password], input[type=text] { width: 240px; }
+  .hidden { display: none !important; }
+  .authnote { font: 11px var(--mono); color: var(--dim); }
+  .authnote b { color: var(--green); font-weight: 500; }
   button {
     background: var(--panel-2); border: 1px solid var(--line); color: var(--text);
     border-radius: 6px; padding: 6px 12px; cursor: pointer; font-size: 12px;
@@ -93,8 +97,11 @@
   <h1>claude<span>-bridge</span></h1>
   <span class="meta" id="mode" style="color:var(--dim);font:12px var(--mono)"></span>
   <span class="spacer"></span>
-  <input type="password" id="token" placeholder="API token" autocomplete="off" />
-  <button id="connect">Connect</button>
+  <span class="authnote hidden" id="authnote"></span>
+  <select id="tokenPick" class="hidden" title="API tokens this server accepts"></select>
+  <button id="copy" class="hidden" title="Copy token">Copy</button>
+  <input type="password" id="token" class="hidden" placeholder="API token" autocomplete="off" />
+  <button id="connect" class="hidden">Connect</button>
   <button id="clear">Clear feed</button>
 </header>
 
@@ -112,7 +119,7 @@
 
   <div class="card" style="min-width:0">
     <h2>Activity</h2>
-    <div id="feed"><div class="empty">Enter your API token and connect.</div></div>
+    <div id="feed"><div class="empty">connecting…</div></div>
   </div>
 </main>
 
@@ -121,10 +128,14 @@
   const $ = (id) => document.getElementById(id);
   const store = window.localStorage;
   const tokenInput = $("token");
-  tokenInput.value = store.getItem("bridge-token") || "";
+  const tokenPick = $("tokenPick");
 
   let source = null;
   let poller = null;
+
+  // The active credential: whichever the server handed us, or one typed in.
+  const currentToken = () =>
+    (tokenPick.classList.contains("hidden") ? tokenInput.value : tokenPick.value).trim();
 
   const fmt = {
     num: (n) => (n ?? 0).toLocaleString(),
@@ -140,7 +151,7 @@
 
   const esc = (s) => String(s ?? "").replace(/[<>&]/g, (c) => ({ "<": "&lt;", ">": "&gt;", "&": "&amp;" }[c]));
 
-  const auth = () => "api_key=" + encodeURIComponent(tokenInput.value.trim());
+  const auth = () => "api_key=" + encodeURIComponent(currentToken());
 
   async function api(path, options = {}) {
     const sep = path.includes("?") ? "&" : "?";
@@ -249,6 +260,8 @@
         renderStats(data);
         renderSessions(data.sessions);
         $("dot").classList.add("live");
+        const empty = $("feed").querySelector(".empty");
+        if (empty) empty.textContent = "connected — waiting for traffic";
       } catch {
         $("dot").classList.remove("live");
       }
@@ -256,9 +269,9 @@
   }
 
   function connect() {
-    const token = tokenInput.value.trim();
-    if (!token) return;
-    store.setItem("bridge-token", token);
+    const token = currentToken();
+    if (!token && authRequired) return;
+    if (token) store.setItem("bridge-token", token);
 
     if (source) source.close();
     if (poller) clearInterval(poller);
@@ -274,9 +287,67 @@
   }
 
   $("connect").onclick = connect;
-  $("clear").onclick = () => { $("feed").innerHTML = '<div class="empty">cleared</div>'; };
+  $("clear").onclick = () => { $("feed").innerHTML = '<div class="empty">connected — waiting for traffic</div>'; };
   tokenInput.onkeydown = (e) => { if (e.key === "Enter") connect(); };
-  if (tokenInput.value) connect();
+  tokenPick.onchange = connect;
+
+  $("copy").onclick = async () => {
+    try {
+      await navigator.clipboard.writeText(currentToken());
+      $("copy").textContent = "Copied";
+      setTimeout(() => ($("copy").textContent = "Copy"), 1200);
+    } catch { /* clipboard blocked; the value is visible in the picker anyway */ }
+  };
+
+  let authRequired = true;
+
+  /**
+   * Ask the server who we are before showing anything. On loopback it hands
+   * back the tokens it accepts, so the dashboard authenticates itself instead
+   * of demanding a key the operator already has in their terminal.
+   */
+  async function bootstrap() {
+    let info = null;
+    try {
+      info = await (await fetch("/admin/bootstrap")).json();
+    } catch { /* fall through to manual entry */ }
+
+    authRequired = info ? info.authRequired : true;
+
+    if (info && !info.authRequired) {
+      $("authnote").textContent = "auth disabled";
+      $("authnote").classList.remove("hidden");
+      connect();
+      return;
+    }
+
+    if (info && info.tokens && info.tokens.length > 0) {
+      tokenPick.innerHTML = info.tokens
+        .map((t) => `<option value="${esc(t)}">${esc(t)}</option>`)
+        .join("");
+
+      // Prefer the token used last, when it is still one the server accepts.
+      const remembered = store.getItem("bridge-token");
+      if (remembered && info.tokens.includes(remembered)) tokenPick.value = remembered;
+
+      tokenPick.classList.remove("hidden");
+      $("copy").classList.remove("hidden");
+      $("authnote").innerHTML = `<b>auto-authenticated</b> · ${info.tokens.length} token${info.tokens.length > 1 ? "s" : ""}`;
+      $("authnote").classList.remove("hidden");
+      connect();
+      return;
+    }
+
+    // Remote, proxied, or disclosure disabled: ask for the key.
+    tokenInput.value = store.getItem("bridge-token") || "";
+    tokenInput.classList.remove("hidden");
+    $("connect").classList.remove("hidden");
+    $("authnote").textContent = info && !info.local ? "remote — token required" : "token required";
+    $("authnote").classList.remove("hidden");
+    if (tokenInput.value) connect();
+  }
+
+  bootstrap();
 })();
 </script>
 </body>

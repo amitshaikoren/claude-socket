@@ -42,6 +42,9 @@
     "turnTimeoutMs": 1200000
   },
 
+  "_dashboard_comment": "localAutoAuth lets a dashboard opened on this machine fetch the API tokens and connect without you pasting one. Only ever disclosed to a direct loopback request. Set false to always require manual entry.",
+  "dashboard": { "localAutoAuth": true },
+
   "logLevel": "info",
 
   "_models_comment": "Optional. Omit to use the default catalog. Rename 'id' freely: it is what clients see, while 'model' is what the CLI is told.",

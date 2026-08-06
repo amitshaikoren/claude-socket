@@ -157,9 +157,15 @@ it reliably in testing, but a malformed call is dropped rather than surfaced as 
 
 **Dashboard** — `http://127.0.0.1:8787/ui`. Totals, live sessions with per-session turn and
 cost counts, and a streaming activity feed showing each turn's prompt, reply, token split,
-and tool use. Enter your API token once; it is kept in `localStorage`. The page shell needs
-no auth (a browser cannot attach a header to a navigation); everything it fetches does.
-Sessions can be killed from the table.
+and tool use. Sessions can be killed from the table.
+
+Opened locally it **connects on its own** — no key to paste. The page asks
+`GET /admin/bootstrap`, which discloses the tokens the server accepts, and it authenticates
+itself; a picker lists every configured token if there is more than one. The disclosure is
+narrow on purpose: only for a request that arrived directly on the loopback interface and
+carries no `X-Forwarded-For`, `X-Real-IP`, or `Forwarded` header, since a proxy hop would
+make every remote request look local. A remote browser still gets the manual token prompt.
+Set `dashboard.localAutoAuth: false` to require typing the key even locally.
 
 **CLI** — `node src/cli.ts <command>`, or `npm run cli --`. Reads `BRIDGE_URL` and
 `BRIDGE_TOKEN`, or takes `--url` / `--token`.
@@ -200,6 +206,7 @@ input tokens because everything else was a cache hit.
 | `DELETE /admin/sessions/{id}` | Terminate one session. |
 | `GET /admin/stats` | Totals, sessions, config, rate-limit state. |
 | `GET /admin/events` | SSE activity feed; `?history=N` replays recent events first. |
+| `GET /admin/bootstrap` | Dashboard self-auth; returns tokens only to a direct loopback request. |
 | `GET /ui` | Dashboard. |
 | `GET /health` | No auth required. |
 

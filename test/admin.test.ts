@@ -34,6 +34,65 @@ describe("dashboard and admin API", () => {
     assert.equal((await fetch(`${server.base}/admin/stats`)).status, 401);
   });
 
+  test("bootstrap hands tokens to a local dashboard so it can self-authenticate", async () => {
+    const res = await fetch(`${server.base}/admin/bootstrap`);
+    assert.equal(res.status, 200);
+    const body = (await res.json()) as any;
+    assert.equal(body.local, true);
+    assert.equal(body.authRequired, true);
+    assert.deepEqual(body.tokens, ["test-token"]);
+
+    // The disclosed token must actually work, or auto-connect is a lie.
+    const stats = await fetch(`${server.base}/admin/stats?api_key=${body.tokens[0]}`);
+    assert.equal(stats.status, 200);
+  });
+
+  test("bootstrap withholds tokens from a proxied request", async () => {
+    // A forwarding header means the peer address is the proxy, not the client,
+    // so loopback can no longer be trusted as proof of locality.
+    for (const header of ["x-forwarded-for", "x-real-ip", "forwarded"]) {
+      const res = await fetch(`${server.base}/admin/bootstrap`, {
+        headers: { [header]: "203.0.113.9" },
+      });
+      const body = (await res.json()) as any;
+      assert.equal(body.local, false, `${header} must defeat auto-auth`);
+      assert.deepEqual(body.tokens, [], `${header} must withhold tokens`);
+    }
+  });
+
+  test("bootstrap withholds tokens when auto-auth is switched off", async () => {
+    const strict = await startTestServer(
+      (() => {
+        const cfg = server.cfg;
+        return { ...cfg, dashboard: { localAutoAuth: false } };
+      })(),
+    );
+    try {
+      const body = (await (await fetch(`${strict.base}/admin/bootstrap`)).json()) as any;
+      assert.equal(body.local, false);
+      assert.deepEqual(body.tokens, []);
+    } finally {
+      await strict.close();
+    }
+  });
+
+  test("bootstrap reports when auth is disabled entirely", async () => {
+    const open = await startTestServer(
+      (() => {
+        const cfg = server.cfg;
+        return { ...cfg, auth: { tokens: [], required: false } };
+      })(),
+    );
+    try {
+      const body = (await (await fetch(`${open.base}/admin/bootstrap`)).json()) as any;
+      assert.equal(body.authRequired, false);
+      assert.deepEqual(body.tokens, []);
+      assert.equal((await fetch(`${open.base}/admin/stats`)).status, 200);
+    } finally {
+      await open.close();
+    }
+  });
+
   test("accepts the token as a query parameter, for EventSource", async () => {
     const res = await fetch(`${server.base}/admin/stats?api_key=test-token`);
     assert.equal(res.status, 200);
