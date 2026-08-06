@@ -157,6 +157,46 @@ describe("CLI argument construction", () => {
     assert.equal(args[args.indexOf("--effort") + 1], "high");
   });
 
+  test("a base URL pointing back at this server is stripped from the child", () => {
+    // Without this the spawned CLI would call the bridge, which would spawn
+    // another CLI, without end.
+    const previous = process.env["ANTHROPIC_BASE_URL"];
+    process.env["ANTHROPIC_BASE_URL"] = `http://127.0.0.1:${cfg.server.port}/v1`;
+    try {
+      const plan = buildSpawnPlan(cfg, {
+        mode: "oracle",
+        model: "claude-sonnet-5",
+        systemPrompt: "",
+        effort: null,
+        cwd: process.cwd(),
+        jsonSchema: null,
+      });
+      assert.ok(plan.unsetEnv.includes("ANTHROPIC_BASE_URL"));
+    } finally {
+      if (previous === undefined) delete process.env["ANTHROPIC_BASE_URL"];
+      else process.env["ANTHROPIC_BASE_URL"] = previous;
+    }
+  });
+
+  test("an unrelated base URL is left alone", () => {
+    const previous = process.env["ANTHROPIC_BASE_URL"];
+    process.env["ANTHROPIC_BASE_URL"] = "https://gateway.corp.example.com";
+    try {
+      const plan = buildSpawnPlan(cfg, {
+        mode: "oracle",
+        model: "claude-sonnet-5",
+        systemPrompt: "",
+        effort: null,
+        cwd: process.cwd(),
+        jsonSchema: null,
+      });
+      assert.deepEqual(plan.unsetEnv, []);
+    } finally {
+      if (previous === undefined) delete process.env["ANTHROPIC_BASE_URL"];
+      else process.env["ANTHROPIC_BASE_URL"] = previous;
+    }
+  });
+
   test("a JSON schema is forwarded to the CLI", () => {
     const schema = { type: "object", properties: { name: { type: "string" } } };
     const plan = buildSpawnPlan(cfg, {

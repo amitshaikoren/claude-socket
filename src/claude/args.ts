@@ -3,13 +3,41 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Config } from "../core/config.ts";
 import type { SessionClass } from "../core/types.ts";
+import { log } from "../util/log.ts";
 
 export interface SpawnPlan {
   args: string[];
   env: Record<string, string>;
+  /** Inherited variables to remove from the child's environment. */
+  unsetEnv: string[];
   cwd: string;
   /** Temp dir holding prompt files; removed when the process is disposed. */
   scratchDir: string;
+}
+
+const BASE_URL_VARS = ["ANTHROPIC_BASE_URL", "ANTHROPIC_API_URL"];
+
+/**
+ * Detect an inherited base URL that points back at this very server.
+ *
+ * Pointing a Claude client at the bridge is the whole idea, but the CLI the
+ * bridge spawns inherits that environment too — so without this the child would
+ * call the bridge, which would spawn another child, forever. Only a
+ * self-reference is stripped; a corporate gateway or proxy URL is left alone.
+ */
+function selfReferencingVars(port: number): string[] {
+  const loopback = new Set(["localhost", "127.0.0.1", "::1", "[::1]", "0.0.0.0"]);
+  return BASE_URL_VARS.filter((name) => {
+    const value = process.env[name];
+    if (!value) return false;
+    try {
+      const url = new URL(value);
+      const urlPort = Number(url.port || (url.protocol === "https:" ? 443 : 80));
+      return loopback.has(url.hostname) && urlPort === port;
+    } catch {
+      return false;
+    }
+  });
 }
 
 /**
@@ -85,5 +113,10 @@ export function buildSpawnPlan(cfg: Config, cls: SessionClass, resumeSessionId?:
   args.push(...cfg.claude.extraArgs);
   Object.assign(env, cfg.claude.env);
 
-  return { args, env, cwd: cls.cwd, scratchDir };
+  const unsetEnv = selfReferencingVars(cfg.server.port).filter((name) => !(name in cfg.claude.env));
+  if (unsetEnv.length > 0) {
+    log.warn(`unsetting ${unsetEnv.join(", ")} for the CLI: it points back at this server`);
+  }
+
+  return { args, env, unsetEnv, cwd: cls.cwd, scratchDir };
 }

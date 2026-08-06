@@ -224,6 +224,121 @@ Auth accepts `Authorization: Bearer`, `x-api-key`, or `?api_key=`, compared in c
 
 Streaming responses echo `x-claude-session`, so a client can pin follow-ups explicitly.
 
+## For Claude
+
+*Instructions for an AI agent asked to "connect to claude-bridge". Follow them in order.*
+
+### 1. Find out whether it is running
+
+```bash
+curl -s http://127.0.0.1:8787/health
+```
+
+`{"status":"ok","service":"claude-bridge",...}` means it is up. If the connection is
+refused, start it from the project directory and wait for the banner:
+
+```bash
+cd D:/projects/claude-bridge && npm start
+```
+
+It runs in the foreground, so start it in a background shell if you need to keep working.
+A different port means `--port N`; adjust every URL below to match.
+
+### 2. Get a token — do not ask the user for one
+
+```bash
+curl -s http://127.0.0.1:8787/admin/bootstrap
+```
+
+```json
+{"authRequired":true,"local":true,"tokens":["sk-bridge-..."],"defaultMode":"oracle"}
+```
+
+Use `tokens[0]`. This works because you are on the same machine; it returns an empty list
+for remote callers. If `authRequired` is `false`, no credential is needed at all. If the
+list is empty but auth is required, then ask the user for the key.
+
+Capture it into a variable. Do not reach for `jq` — it is frequently absent, whereas Node is
+a prerequisite of this project and therefore always present:
+
+```bash
+# bash
+TOKEN=$(curl -s http://127.0.0.1:8787/admin/bootstrap \
+  | node -pe "JSON.parse(require('fs').readFileSync(0,'utf8')).tokens[0]")
+```
+
+```powershell
+# PowerShell
+$TOKEN = (Invoke-RestMethod http://127.0.0.1:8787/admin/bootstrap).tokens[0]
+```
+
+### 3. Call it
+
+The base URL is `http://127.0.0.1:8787/v1` and the token is a normal bearer key. Both
+dialects work — use whichever suits the client you are configuring.
+
+```bash
+# OpenAI-compatible
+curl -s http://127.0.0.1:8787/v1/chat/completions \
+  -H "authorization: Bearer $TOKEN" -H "content-type: application/json" \
+  -d '{"model":"claude-sonnet-5","messages":[{"role":"user","content":"say hi"}]}'
+
+# Anthropic-compatible
+curl -s http://127.0.0.1:8787/v1/messages \
+  -H "x-api-key: $TOKEN" -H "content-type: application/json" \
+  -d '{"model":"claude-sonnet-5","max_tokens":64,"messages":[{"role":"user","content":"say hi"}]}'
+```
+
+For an SDK or a tool that takes environment variables:
+
+```bash
+export OPENAI_BASE_URL=http://127.0.0.1:8787/v1
+export OPENAI_API_KEY=$TOKEN
+```
+
+### 4. Pick the right model
+
+`GET /v1/models` lists them. The choice that matters is the suffix:
+
+- `claude-sonnet-5` — **oracle**. No tools, no filesystem. Use this for anything that is
+  just text in, text out: classification, summarizing, generation, an LLM inside a script.
+- `claude-sonnet-5-harness` — **agent**. Real tools, edits files, runs commands, confined to
+  `workspaces/`. Use only when the caller genuinely wants work performed, and say so plainly
+  to the user, because it executes on their machine.
+
+Default to oracle. Swap `sonnet` for `opus`, `fable`, or `haiku-4-5` as needed, or append
+`:high` for more effort (`claude-opus-5:high`).
+
+### 5. Confirm it actually worked
+
+```bash
+curl -s "http://127.0.0.1:8787/admin/stats?api_key=$TOKEN"
+```
+
+`totals.turns` should have increased and `totals.costUsd` should be non-zero. Report the
+token counts back to the user — they are the point of this server. For a live view, tell
+them to open `http://127.0.0.1:8787/ui`, which authenticates itself.
+
+### Things that will otherwise surprise you
+
+- **Never set `ANTHROPIC_BASE_URL` to this server globally.** The bridge spawns `claude`,
+  which would inherit the variable and call the bridge again, without end. The bridge strips
+  a self-referencing value from its children as a safety net, but do not rely on it — set
+  such variables per-command, not in a shell profile or system environment.
+- **`temperature`, `top_p`, `max_tokens`, `stop`, and `n` are accepted and ignored.** Do not
+  tune them and do not report that you did; the CLI exposes no such controls.
+- **Conversations are stateful behind the scenes.** Sending the full message history is
+  correct and cheap — the bridge matches it to a live session and bills only the new turn.
+  Do not try to "save tokens" by trimming history; that breaks prefix matching and costs
+  *more*, because it starts a fresh session.
+- **The `model` you send is echoed back verbatim**, and an unknown name silently falls back
+  to the default rather than erroring. Do not treat a successful response as proof that the
+  model you named exists — check `/v1/models`.
+- **Tool calling is prompt-driven.** `tools` and `tool_choice` work in both dialects, but a
+  malformed call is dropped rather than surfaced, so handle a missing `tool_calls` field.
+- Errors come back in the shape of whichever dialect you called, so parse
+  `error.message` for `/v1/chat/completions` and `error.type` for `/v1/messages`.
+
 ## Configuration
 
 Copy `bridge.config.example.json` to `bridge.config.json`, or use flags and env vars —

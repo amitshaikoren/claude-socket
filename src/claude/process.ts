@@ -81,10 +81,14 @@ function spawnCli(
   args: string[],
   cwd: string,
   env: Record<string, string>,
+  unsetEnv: string[] = [],
 ): ChildProcessWithoutNullStreams {
+  const childEnv: Record<string, string | undefined> = { ...process.env, ...env };
+  for (const name of unsetEnv) delete childEnv[name];
+
   const options = {
     cwd,
-    env: { ...process.env, ...env },
+    env: childEnv,
     stdio: ["pipe", "pipe", "pipe"] as Array<"pipe">,
     windowsHide: true,
   };
@@ -146,7 +150,13 @@ export class ClaudeProcess {
     });
 
     log.debug("spawning claude", { key: this.key.slice(0, 8), mode: cls.mode, model: cls.model });
-    this.#child = spawnCli(cfg.claude.binary, this.#plan.args, this.#plan.cwd, this.#plan.env);
+    this.#child = spawnCli(
+      cfg.claude.binary,
+      this.#plan.args,
+      this.#plan.cwd,
+      this.#plan.env,
+      this.#plan.unsetEnv,
+    );
 
     this.#child.stdout.setEncoding("utf8");
     this.#child.stdout.on("data", (chunk: string) => this.#onStdout(chunk));
