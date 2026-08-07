@@ -11,6 +11,7 @@ import { sendJson, type Ctx } from "./context.ts";
 import { handleChatCompletions, handleModels } from "../api/openai.ts";
 import { handleCountTokens, handleMessages } from "../api/anthropic.ts";
 import { BridgeError } from "../core/types.ts";
+import { parseBucket, type UsageFilter, type UsageStore } from "../core/store.ts";
 import { log } from "../util/log.ts";
 
 const MAX_BODY_BYTES = 32 * 1024 * 1024;
@@ -20,7 +21,8 @@ const CORS_HEADERS: Record<string, string> = {
   "access-control-allow-methods": "GET, POST, DELETE, OPTIONS",
   "access-control-allow-headers":
     "authorization, content-type, x-api-key, anthropic-version, anthropic-beta, " +
-    "x-claude-mode, x-claude-effort, x-claude-cwd, x-claude-session, x-claude-max-budget-usd",
+    "x-claude-mode, x-claude-effort, x-claude-cwd, x-claude-session, x-claude-max-budget-usd, " +
+    "x-claude-tools, x-claude-disallowed-tools",
   "access-control-expose-headers": "x-claude-session, x-ratelimit-status, x-ratelimit-reset",
 };
 
@@ -65,9 +67,13 @@ function toBridgeError(err: unknown): BridgeError {
   return new BridgeError(500, "internal_error", message);
 }
 
-export function createBridgeServer(cfg: Config, sessions: SessionManager): Server {
+export function createBridgeServer(
+  cfg: Config,
+  sessions: SessionManager,
+  store: UsageStore,
+): Server {
   const server = createServer((req, res) => {
-    void handle(cfg, sessions, req, res);
+    void handle(cfg, sessions, store, req, res);
   });
   server.keepAliveTimeout = 120_000;
   server.headersTimeout = 125_000;
@@ -114,6 +120,53 @@ function streamEvents(res: ServerResponse, history: number): void {
   });
 }
 
+/**
+ * Read the usage filter out of the query string.
+ *
+ * `from`/`to` accept either epoch milliseconds or anything Date can parse, and
+ * `window` is the shorthand the dashboard actually uses: `24h`, `7d`, `30m`.
+ * Everything is optional — no filter means the whole history.
+ */
+function parseUsageFilter(params: URLSearchParams): UsageFilter {
+  const time = (key: string): number | undefined => {
+    const raw = params.get(key);
+    if (!raw) return undefined;
+    const asNumber = Number(raw);
+    if (Number.isFinite(asNumber) && raw.trim() !== "") return asNumber;
+    const parsed = Date.parse(raw);
+    return Number.isNaN(parsed) ? undefined : parsed;
+  };
+
+  let from = time("from");
+  const window = params.get("window");
+  if (from === undefined && window) {
+    const match = /^(\d+)([mhd])$/.exec(window.trim());
+    if (match) {
+      const unit = { m: 60_000, h: 3_600_000, d: 86_400_000 }[match[2] as "m" | "h" | "d"];
+      from = Date.now() - Number(match[1]) * unit;
+    }
+  }
+
+  const status = params.get("status");
+  const limit = Number(params.get("limit"));
+  const offset = Number(params.get("offset"));
+
+  return {
+    from,
+    to: time("to"),
+    mode: params.get("mode") ?? undefined,
+    model: params.get("model") ?? undefined,
+    sessionId: params.get("session") ?? undefined,
+    dialect: params.get("dialect") ?? undefined,
+    tool: params.get("tool") ?? undefined,
+    q: params.get("q") ?? undefined,
+    status: status === "ok" || status === "error" ? status : undefined,
+    // Capped: this endpoint is a dashboard feed, not a bulk export.
+    limit: Number.isFinite(limit) && limit > 0 ? Math.min(limit, 1000) : 200,
+    offset: Number.isFinite(offset) && offset > 0 ? offset : 0,
+  };
+}
+
 /** The dashboard is a single self-contained file, read fresh on each request. */
 function serveDashboard(res: ServerResponse): void {
   const file = join(projectRoot, "src", "ui", "index.html");
@@ -129,6 +182,7 @@ function serveDashboard(res: ServerResponse): void {
 async function handle(
   cfg: Config,
   sessions: SessionManager,
+  store: UsageStore,
   req: IncomingMessage,
   res: ServerResponse,
 ): Promise<void> {
@@ -182,13 +236,22 @@ async function handle(
     }
 
     if (req.method === "GET" && path === "/v1/models") {
-      handleModels({ cfg, sessions, req, res, body: {}, signal: new AbortController().signal });
+      handleModels({
+        cfg,
+        sessions,
+        store,
+        req,
+        res,
+        body: {},
+        signal: new AbortController().signal,
+      });
       return;
     }
 
     if (req.method === "GET" && path.startsWith("/v1/models/")) {
       const id = decodeURIComponent(path.slice("/v1/models/".length));
       const entry = resolveModel(cfg, id);
+      const section = entry.mode === "semi" ? cfg.semi : entry.mode === "harness" ? cfg.harness : null;
       sendJson(res, 200, {
         id: entry.id,
         object: "model",
@@ -196,6 +259,8 @@ async function handle(
         owned_by: entry.ownedBy,
         context_window: entry.contextWindow,
         mode: entry.mode,
+        // What the agent may run. `null` is the CLI's own default set.
+        tools: entry.tools !== undefined ? entry.tools : (section?.tools ?? null),
       });
       return;
     }
@@ -224,6 +289,9 @@ async function handle(
           maxSessions: cfg.sessions.max,
           reuse: cfg.sessions.reuse,
           claudeBinary: cfg.claude.binary,
+          usagePersisted: cfg.usage.persist,
+          semiTools: cfg.semi.tools,
+          harnessTools: cfg.harness.tools,
         },
       });
       return;
@@ -231,6 +299,52 @@ async function handle(
 
     if (req.method === "GET" && path === "/admin/events") {
       streamEvents(res, Number(url.searchParams.get("history") ?? 60));
+      return;
+    }
+
+    // ── usage history ─────────────────────────────────────────────────────
+    // Everything below reads the persisted store rather than live telemetry,
+    // so it survives restarts and answers questions about last week.
+
+    if (req.method === "GET" && path === "/admin/usage") {
+      const filter = parseUsageFilter(url.searchParams);
+      sendJson(res, 200, {
+        filter,
+        summary: store.summary(filter),
+        facets: store.facets(),
+      });
+      return;
+    }
+
+    if (req.method === "GET" && path === "/admin/usage/turns") {
+      const filter = parseUsageFilter(url.searchParams);
+      const turns = store.turns(filter);
+      sendJson(res, 200, {
+        turns,
+        // Lets the dashboard show "showing 200 of 4,312" without a second call.
+        total: store.summary(filter).turns,
+        limit: filter.limit,
+        offset: filter.offset,
+      });
+      return;
+    }
+
+    if (req.method === "GET" && path.startsWith("/admin/usage/turns/")) {
+      const id = decodeURIComponent(path.slice("/admin/usage/turns/".length)).replace(/\/steps$/, "");
+      sendJson(res, 200, { turnId: id, steps: store.steps(id) });
+      return;
+    }
+
+    if (req.method === "GET" && path === "/admin/usage/series") {
+      const filter = parseUsageFilter(url.searchParams);
+      const bucket = parseBucket(url.searchParams.get("bucket"));
+      sendJson(res, 200, { bucket, points: store.series(filter, bucket) });
+      return;
+    }
+
+    if (req.method === "GET" && path === "/admin/usage/tools") {
+      const filter = parseUsageFilter(url.searchParams);
+      sendJson(res, 200, { tools: store.tools(filter) });
       return;
     }
 
@@ -248,7 +362,7 @@ async function handle(
     });
 
     const body = await readBody(req);
-    const ctx: Ctx = { cfg, sessions, req, res, body, signal: controller.signal };
+    const ctx: Ctx = { cfg, sessions, store, req, res, body, signal: controller.signal };
 
     const started = Date.now();
     telemetry.emit("request", {

@@ -17,11 +17,40 @@ export interface Totals {
   requests: number;
   turns: number;
   errors: number;
+  /** Calls to the caller's own tools, via the tagged protocol. */
   toolCalls: number;
+  /** Tools the agent ran itself, in the harness and semi modes. */
+  agentToolCalls: number;
+  /** Model calls: an agentic turn is many of these, a plain turn is one. */
+  steps: number;
   inputTokens: number;
   outputTokens: number;
   cacheReadTokens: number;
+  cacheCreationTokens: number;
+  /** input + cache creation + output. See core/usage.ts for why reads are out. */
+  headline: number;
+  /** High-water mark of a single call's context, across the process's lifetime. */
+  peakContext: number;
   costUsd: number;
+}
+
+function zeroTotals(): Totals {
+  return {
+    startedAt: Date.now(),
+    requests: 0,
+    turns: 0,
+    errors: 0,
+    toolCalls: 0,
+    agentToolCalls: 0,
+    steps: 0,
+    inputTokens: 0,
+    outputTokens: 0,
+    cacheReadTokens: 0,
+    cacheCreationTokens: 0,
+    headline: 0,
+    peakContext: 0,
+    costUsd: 0,
+  };
 }
 
 const MAX_EVENTS = 500;
@@ -31,17 +60,7 @@ class Telemetry {
   #subscribers = new Set<(event: TelemetryEvent) => void>();
   #seq = 0;
 
-  totals: Totals = {
-    startedAt: Date.now(),
-    requests: 0,
-    turns: 0,
-    errors: 0,
-    toolCalls: 0,
-    inputTokens: 0,
-    outputTokens: 0,
-    cacheReadTokens: 0,
-    costUsd: 0,
-  };
+  totals: Totals = zeroTotals();
 
   emit(type: TelemetryEvent["type"], data: Record<string, unknown>): void {
     const event: TelemetryEvent = { ...data, seq: ++this.#seq, at: Date.now(), type };
@@ -55,14 +74,14 @@ class Telemetry {
         break;
       case "error":
         this.totals.errors += 1;
+        // A failed turn still burned tokens; leaving them out would make the
+        // totals quietly optimistic. Request-level errors carry no usage keys
+        // and so contribute nothing.
+        this.#addUsage(data);
         break;
       case "turn": {
         this.totals.turns += 1;
-        this.totals.inputTokens += Number(data["inputTokens"] ?? 0);
-        this.totals.outputTokens += Number(data["outputTokens"] ?? 0);
-        this.totals.cacheReadTokens += Number(data["cacheReadTokens"] ?? 0);
-        this.totals.costUsd += Number(data["costUsd"] ?? 0);
-        this.totals.toolCalls += Number(data["toolCalls"] ?? 0);
+        this.#addUsage(data);
         break;
       }
       default:
@@ -78,6 +97,22 @@ class Telemetry {
     }
   }
 
+  #addUsage(data: Record<string, unknown>): void {
+    const n = (key: string) => Number(data[key] ?? 0) || 0;
+    this.totals.inputTokens += n("inputTokens");
+    this.totals.outputTokens += n("outputTokens");
+    this.totals.cacheReadTokens += n("cacheReadTokens");
+    this.totals.cacheCreationTokens += n("cacheCreationTokens");
+    this.totals.headline += n("headline");
+    this.totals.costUsd += n("costUsd");
+    this.totals.toolCalls += n("toolCalls");
+    this.totals.agentToolCalls += n("agentToolCalls");
+    this.totals.steps += n("steps");
+    // A max, not a sum: this is how full the window got, not how much flowed.
+    const peak = n("peakContext");
+    if (peak > this.totals.peakContext) this.totals.peakContext = peak;
+  }
+
   subscribe(fn: (event: TelemetryEvent) => void): () => void {
     this.#subscribers.add(fn);
     return () => this.#subscribers.delete(fn);
@@ -89,17 +124,7 @@ class Telemetry {
 
   reset(): void {
     this.#events = [];
-    this.totals = {
-      startedAt: Date.now(),
-      requests: 0,
-      turns: 0,
-      errors: 0,
-      toolCalls: 0,
-      inputTokens: 0,
-      outputTokens: 0,
-      cacheReadTokens: 0,
-      costUsd: 0,
-    };
+    this.totals = zeroTotals();
   }
 }
 

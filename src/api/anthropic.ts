@@ -2,8 +2,10 @@ import { randomUUID } from "node:crypto";
 import type { Ctx } from "../http/context.ts";
 import { sendJson } from "../http/context.ts";
 import { SseWriter } from "../http/sse.ts";
-import { resolveTarget } from "../core/resolve.ts";
+import { activityMode, resolveTarget } from "../core/resolve.ts";
 import { formatToolResult, formatToolUse } from "../core/activity.ts";
+import { recordTurn } from "../core/record.ts";
+import { billed, peakContext, type Step } from "../core/usage.ts";
 import {
   buildToolPrompt,
   extractToolCalls,
@@ -14,7 +16,6 @@ import {
   ToolCallScanner,
   type ParsedCall,
 } from "../core/tools.ts";
-import { preview, telemetry } from "../core/telemetry.ts";
 import {
   BridgeError,
   emptyUsage,
@@ -121,13 +122,33 @@ function normalize(raw: unknown): BridgeMessage[] {
   return messages;
 }
 
-function usagePayload(usage: Usage): Record<string, unknown> {
+/**
+ * Anthropic's usage shape, plus what this server knows and the API cannot say.
+ *
+ * `billed_tokens` is the headline — input + cache creation + output, leaving out
+ * replayed cache reads. `step_usage` breaks a turn down by model call, which for
+ * an agent looping through tools is the only place a per-call number exists.
+ */
+function usagePayload(usage: Usage, steps: Step[] = []): Record<string, unknown> {
   return {
     input_tokens: usage.inputTokens,
     output_tokens: usage.outputTokens,
     cache_read_input_tokens: usage.cacheReadTokens,
     cache_creation_input_tokens: usage.cacheCreationTokens,
     cost_usd: Number(usage.costUsd.toFixed(6)),
+    billed_tokens: billed(usage),
+    peak_context_tokens: peakContext(steps),
+    steps: steps.length,
+    step_usage: steps.map((step) => ({
+      index: step.index,
+      model: step.model,
+      input_tokens: step.usage.inputTokens,
+      output_tokens: step.usage.outputTokens,
+      cache_read_input_tokens: step.usage.cacheReadTokens,
+      cache_creation_input_tokens: step.usage.cacheCreationTokens,
+      billed_tokens: billed(step.usage),
+      tools: step.tools.map((t) => t.name),
+    })),
   };
 }
 
@@ -218,7 +239,8 @@ export async function handleMessages(ctx: Ctx): Promise<void> {
   const target = resolveTarget(ctx.cfg, ctx.req.headers, requestedModel, system, null, toolPrompt);
   const advertised = requestedModel ?? target.entry.id;
   const stream = body["stream"] === true;
-  const activity = target.cls.mode === "harness" ? ctx.cfg.harness.activity : "off";
+  const activity = activityMode(ctx.cfg, target.cls.mode);
+  const startedAt = Date.now();
   const promptPreview = messages[messages.length - 1]!.content
     .filter((b) => b.type === "text")
     .map((b) => b.text)
@@ -242,11 +264,14 @@ export async function handleMessages(ctx: Ctx): Promise<void> {
     const err = first.value;
     throw new BridgeError(err.status, err.type, err.message);
   }
-  const sessionId = !first.done && first.value.kind === "session" ? first.value.sessionId : "";
+  const session = !first.done && first.value.kind === "session" ? first.value : null;
+  const sessionId = session?.sessionId ?? "";
+  const reused = session?.reused ?? false;
 
   if (!stream) {
     let text = "";
     let usage = emptyUsage();
+    let steps: Step[] = [];
     let stopReason = "end_turn";
     for (;;) {
       const next = await iterator.next();
@@ -256,6 +281,7 @@ export async function handleMessages(ctx: Ctx): Promise<void> {
       if (event.kind === "done") {
         text = event.text;
         usage = event.usage;
+        steps = event.steps;
         stopReason = event.stopReason;
       }
     }
@@ -274,19 +300,21 @@ export async function handleMessages(ctx: Ctx): Promise<void> {
     }
     if (content.length === 0) content.push({ type: "text", text: "" });
 
-    telemetry.emit("turn", {
+    recordTurn(ctx.store, {
+      startedAt,
       sessionId,
       dialect: "anthropic",
-      model: advertised,
       mode: target.cls.mode,
+      model: target.cls.model,
+      advertisedModel: advertised,
       stream: false,
-      inputTokens: usage.inputTokens,
-      outputTokens: usage.outputTokens,
-      cacheReadTokens: usage.cacheReadTokens,
-      costUsd: usage.costUsd,
-      toolCalls: calls.length,
-      prompt: preview(promptPreview),
-      reply: preview(text || calls.map((c) => `${c.name}(${c.argumentsJson})`).join(" ")),
+      cwd: target.cls.cwd,
+      reused,
+      usage,
+      steps,
+      clientToolCalls: calls.length,
+      prompt: promptPreview,
+      reply: text || calls.map((c) => `${c.name}(${c.argumentsJson})`).join(" "),
     });
 
     sendJson(ctx.res, 200, {
@@ -297,7 +325,7 @@ export async function handleMessages(ctx: Ctx): Promise<void> {
       content,
       stop_reason: calls.length > 0 ? "tool_use" : stopReason,
       stop_sequence: null,
-      usage: usagePayload(usage),
+      usage: usagePayload(usage, steps),
     });
     return;
   }
@@ -323,6 +351,7 @@ export async function handleMessages(ctx: Ctx): Promise<void> {
   );
 
   let usage = emptyUsage();
+  let steps: Step[] = [];
   let stopReason = "end_turn";
   let failed: { type: string; message: string } | null = null;
   let calls: ParsedCall[] = [];
@@ -357,6 +386,7 @@ export async function handleMessages(ctx: Ctx): Promise<void> {
           break;
         case "done":
           usage = event.usage;
+          steps = event.steps;
           stopReason = event.stopReason;
           if (scanner) {
             const extracted = extractToolCalls(event.text);
@@ -388,7 +418,7 @@ export async function handleMessages(ctx: Ctx): Promise<void> {
               stop_reason: calls.length > 0 ? "tool_use" : stopReason,
               stop_sequence: null,
             },
-            usage: usagePayload(usage),
+            usage: usagePayload(usage, steps),
           },
           "message_delta",
         );
@@ -397,20 +427,22 @@ export async function handleMessages(ctx: Ctx): Promise<void> {
       sse.end();
     }
 
-    telemetry.emit(failed ? "error" : "turn", {
+    recordTurn(ctx.store, {
+      startedAt,
       sessionId,
       dialect: "anthropic",
-      model: advertised,
       mode: target.cls.mode,
+      model: target.cls.model,
+      advertisedModel: advertised,
       stream: true,
-      inputTokens: usage.inputTokens,
-      outputTokens: usage.outputTokens,
-      cacheReadTokens: usage.cacheReadTokens,
-      costUsd: usage.costUsd,
-      toolCalls: calls.length,
-      prompt: preview(promptPreview),
-      reply: preview(replyText || calls.map((c) => `${c.name}(${c.argumentsJson})`).join(" ")),
-      message: failed?.message,
+      cwd: target.cls.cwd,
+      reused,
+      usage,
+      steps,
+      clientToolCalls: calls.length,
+      prompt: promptPreview,
+      reply: replyText || calls.map((c) => `${c.name}(${c.argumentsJson})`).join(" "),
+      error: failed?.message ?? null,
     });
   }
 }

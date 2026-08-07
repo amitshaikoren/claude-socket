@@ -5,8 +5,9 @@ import { promisify } from "node:util";
 import { loadConfig, type Config } from "./core/config.ts";
 import { SessionManager } from "./claude/sessions.ts";
 import { createBridgeServer } from "./http/server.ts";
+import { createUsageStore } from "./core/store.ts";
 import { log, setLogLevel, type LogLevel } from "./util/log.ts";
-import type { Mode } from "./core/types.ts";
+import { isMode, MODES } from "./core/types.ts";
 
 const execFileAsync = promisify(execFile);
 
@@ -20,9 +21,11 @@ Options:
   --config <path>     Config file (default ./bridge.config.json)
   --token <value>     API token clients must present (repeatable)
   --no-auth           Disable authentication entirely (loopback only, please)
-  --mode <mode>       Default mode for unsuffixed models: oracle | harness
+  --mode <mode>       Default mode for unsuffixed models: oracle | harness | semi
   --model <name>      Default underlying model (default claude-sonnet-5)
   --claude-bin <path> Path to the claude executable
+  --usage-db <path>   Where to keep token history (default ./data/usage.db)
+  --no-usage-db       Keep token history in memory only, lost on restart
   --log-level <level> error | warn | info | debug
   -h, --help          Show this message
 `;
@@ -65,9 +68,20 @@ function parseArgs(argv: string[]): { config: Config; help: boolean } {
         overrides.push((c) => void (c.auth.required = false));
         break;
       case "--mode": {
-        const mode = next() as Mode;
-        if (mode !== "oracle" && mode !== "harness") throw new Error(`invalid mode: ${mode}`);
+        const mode = next();
+        if (!isMode(mode)) throw new Error(`invalid mode: ${mode} (want ${MODES.join(" | ")})`);
         overrides.push((c) => void (c.defaults.mode = mode));
+        break;
+      }
+      case "--no-usage-db":
+        overrides.push((c) => void (c.usage.persist = false));
+        break;
+      case "--usage-db": {
+        const path = next();
+        overrides.push((c) => {
+          c.usage.path = path;
+          c.usage.persist = true;
+        });
         break;
       }
       case "--model": {
@@ -137,7 +151,14 @@ async function main(): Promise<void> {
   else log.warn(`could not run '${cfg.claude.binary} --version'; requests will fail until it works`);
 
   const sessions = new SessionManager(cfg);
-  const server = createBridgeServer(cfg, sessions);
+  const store = await createUsageStore({
+    enabled: cfg.usage.persist,
+    path: cfg.usage.path,
+    flushMs: cfg.usage.flushMs,
+    retentionDays: cfg.usage.retentionDays,
+    memoryMax: cfg.usage.memoryMax,
+  });
+  const server = createBridgeServer(cfg, sessions, store);
 
   await new Promise<void>((resolve, reject) => {
     server.once("error", reject);
@@ -165,13 +186,19 @@ async function main(): Promise<void> {
     log.warn(
       `bound to ${cfg.server.host}: anyone who can reach this port and holds the token ` +
         `can spend your Claude usage` +
-        (cfg.defaults.mode === "harness" ? " and run tools on this machine" : ""),
+        (cfg.defaults.mode === "harness"
+          ? " and run tools on this machine"
+          : cfg.defaults.mode === "semi"
+            ? ` and run ${(cfg.semi.tools ?? []).join(", ") || "tools"} on this machine`
+            : ""),
     );
   }
 
   const shutdown = () => {
     log.info("shutting down");
     sessions.shutdown();
+    // Flushes anything still queued, so the last turns of a run are not lost.
+    store.close();
     server.close(() => process.exit(0));
     setTimeout(() => process.exit(0), 3000).unref();
   };

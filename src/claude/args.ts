@@ -53,9 +53,11 @@ function writePromptFile(dir: string, name: string, contents: string): string {
 /**
  * Translate a session class into a CLI invocation.
  *
- * Oracle mode strips the agent down to a bare completion endpoint: no tools, no
+ * Oracle strips the agent down to a bare completion endpoint: no tools, no
  * settings sources, no MCP, no skills, and a caller-supplied system prompt
- * replacing the Claude Code preamble. Harness mode leaves Claude Code intact.
+ * replacing the Claude Code preamble. Harness leaves Claude Code intact. Semi
+ * takes the same path as harness but passes the session's resolved tool list,
+ * so the agent keeps its loop and loses everything not on it.
  */
 export function buildSpawnPlan(cfg: Config, cls: SessionClass, resumeSessionId?: string): SpawnPlan {
   const scratchDir = mkdtempSync(join(tmpdir(), "claude-bridge-"));
@@ -91,7 +93,7 @@ export function buildSpawnPlan(cfg: Config, cls: SessionClass, resumeSessionId?:
     args.push("--setting-sources", o.settingSources);
     if (o.disableNonEssentialModelCalls) env["DISABLE_NON_ESSENTIAL_MODEL_CALLS"] = "1";
   } else {
-    const h = cfg.harness;
+    const h = cls.mode === "semi" ? cfg.semi : cfg.harness;
     if (cls.systemPrompt) {
       args.push(
         "--append-system-prompt-file",
@@ -100,9 +102,14 @@ export function buildSpawnPlan(cfg: Config, cls: SessionClass, resumeSessionId?:
     }
     args.push("--permission-mode", h.permissionMode);
     if (h.dangerouslySkipPermissions) args.push("--dangerously-skip-permissions");
-    if (h.tools) args.push("--tools", h.tools.join(","));
-    if (h.allowedTools.length > 0) args.push("--allowed-tools", h.allowedTools.join(","));
-    if (h.disallowedTools.length > 0) args.push("--disallowed-tools", h.disallowedTools.join(","));
+    // The tool policy comes from the session class, not from config: it is
+    // resolved per request, and two classes that differ only in their tools are
+    // deliberately different sessions.
+    if (cls.tools.tools) args.push("--tools", cls.tools.tools.join(","));
+    if (cls.tools.allowed.length > 0) args.push("--allowed-tools", cls.tools.allowed.join(","));
+    if (cls.tools.disallowed.length > 0) {
+      args.push("--disallowed-tools", cls.tools.disallowed.join(","));
+    }
     args.push("--setting-sources", h.settingSources);
     // Moves cwd/env/git status out of the system prompt so the cached prefix is
     // stable across sessions and machines.

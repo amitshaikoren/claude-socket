@@ -21,6 +21,7 @@
     "disableNonEssentialModelCalls": true
   },
 
+  "_harness_comment": "Claude Code intact. 'tools': null leaves the CLI's own default set in place.",
   "harness": {
     "workspaceRoot": "./workspaces",
     "allowedCwds": [],
@@ -35,6 +36,22 @@
     "disableNonEssentialModelCalls": true
   },
 
+  "_semi_comment": "Claude Code with a narrowed tool set: the agent keeps its own loop but only over the tools listed here. The default is read-only, which is why this mode is safe to expose when harness is not. A request may narrow the set further via X-Claude-Tools, but never widen it past this list; set allowRequestTools false to ignore the header entirely.",
+  "semi": {
+    "workspaceRoot": "./workspaces",
+    "allowedCwds": [],
+    "permissionMode": "default",
+    "tools": ["Read", "Glob", "Grep", "WebFetch", "WebSearch", "TodoWrite"],
+    "allowedTools": [],
+    "disallowedTools": [],
+    "dangerouslySkipPermissions": false,
+    "appendSystemPrompt": null,
+    "settingSources": "user,project,local",
+    "activity": "reasoning",
+    "disableNonEssentialModelCalls": true,
+    "allowRequestTools": true
+  },
+
   "sessions": {
     "max": 16,
     "idleMs": 900000,
@@ -42,12 +59,21 @@
     "turnTimeoutMs": 1200000
   },
 
+  "_usage_comment": "Token history, one row per turn plus one per model call and tool call inside it. Persisted with node:sqlite so it survives a restart; set persist false to keep it in a memory ring buffer instead. retentionDays 0 keeps everything.",
+  "usage": {
+    "persist": true,
+    "path": "./data/usage.db",
+    "flushMs": 2000,
+    "retentionDays": 90,
+    "memoryMax": 5000
+  },
+
   "_dashboard_comment": "localAutoAuth lets a dashboard opened on this machine fetch the API tokens and connect without you pasting one. Only ever disclosed to a direct loopback request. Set false to always require manual entry.",
   "dashboard": { "localAutoAuth": true },
 
   "logLevel": "info",
 
-  "_models_comment": "Optional. Omit to use the default catalog. Rename 'id' freely: it is what clients see, while 'model' is what the CLI is told.",
+  "_models_comment": "Optional. Omit to use the default catalog. Rename 'id' freely: it is what clients see, while 'model' is what the CLI is told. A 'semi' or 'harness' entry may carry its own 'tools' list, overriding the mode's default, so one catalog can offer several differently-privileged agents.",
   "_models_example": [
     {
       "id": "hermes-70b-local",
@@ -56,6 +82,15 @@
       "effort": null,
       "contextWindow": 128000,
       "ownedBy": "local-inference"
+    },
+    {
+      "id": "hermes-70b-reader",
+      "model": "claude-sonnet-5",
+      "mode": "semi",
+      "effort": null,
+      "contextWindow": 200000,
+      "ownedBy": "local-inference",
+      "tools": ["Read", "Glob", "Grep"]
     },
     {
       "id": "hermes-70b-agent",

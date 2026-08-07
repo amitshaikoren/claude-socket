@@ -1,7 +1,7 @@
 import { readFileSync, existsSync } from "node:fs";
 import { resolve, dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import type { Mode } from "./types.ts";
+import { isMode, type Mode } from "./types.ts";
 import type { LogLevel } from "../util/log.ts";
 
 export const projectRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..", "..");
@@ -17,6 +17,31 @@ export interface ModelEntry {
   /** Cosmetic, reported by /v1/models. */
   contextWindow: number;
   ownedBy: string;
+  /**
+   * Tool set for a `semi` (or `harness`) entry, overriding the mode's config
+   * default. Lets one catalog entry be "the agent, but read-only" and another
+   * be the full thing, without either touching the other.
+   */
+  tools?: string[] | null;
+  allowedTools?: string[];
+  disallowedTools?: string[];
+}
+
+/** Settings shared by the two agentic modes. */
+export interface AgentModeConfig {
+  workspaceRoot: string;
+  /** Absolute directory roots a client may target via X-Claude-Cwd. */
+  allowedCwds: string[];
+  permissionMode: string;
+  tools: string[] | null;
+  allowedTools: string[];
+  disallowedTools: string[];
+  dangerouslySkipPermissions: boolean;
+  appendSystemPrompt: string | null;
+  settingSources: string;
+  /** How intermediate agent activity reaches the client. */
+  activity: "off" | "content" | "reasoning";
+  disableNonEssentialModelCalls: boolean;
 }
 
 export interface Config {
@@ -29,22 +54,28 @@ export interface Config {
     settingSources: string;
     disableNonEssentialModelCalls: boolean;
   };
-  harness: {
-    workspaceRoot: string;
-    /** Absolute directory roots a client may target via X-Claude-Cwd. */
-    allowedCwds: string[];
-    permissionMode: string;
-    tools: string[] | null;
-    allowedTools: string[];
-    disallowedTools: string[];
-    dangerouslySkipPermissions: boolean;
-    appendSystemPrompt: string | null;
-    settingSources: string;
-    /** How intermediate agent activity reaches the client. */
-    activity: "off" | "content" | "reasoning";
-    disableNonEssentialModelCalls: boolean;
+  harness: AgentModeConfig;
+  /**
+   * Claude Code with a narrowed tool set. Same spawn path as `harness`, but the
+   * tools are an allowlist — the defaults here are read-only, so `semi` is safe
+   * to expose by default in a way `harness` is not.
+   */
+  semi: AgentModeConfig & {
+    /** Whether a request may widen its own tool set beyond this default. */
+    allowRequestTools: boolean;
   };
   sessions: { max: number; idleMs: number; reuse: boolean; turnTimeoutMs: number };
+  usage: {
+    /** Persist turn history to SQLite. Off keeps it in a memory ring buffer. */
+    persist: boolean;
+    path: string;
+    /** How often queued records are written. */
+    flushMs: number;
+    /** Rows older than this are dropped at startup. 0 keeps everything. */
+    retentionDays: number;
+    /** Ring-buffer size when `persist` is false. */
+    memoryMax: number;
+  };
   dashboard: {
     /**
      * Hand the configured API tokens to a dashboard loaded from loopback, so a
@@ -64,43 +95,41 @@ const BASE_MODELS: Array<{ model: string; context: number }> = [
   { model: "claude-haiku-4-5", context: 200_000 },
 ];
 
+/**
+ * The default tool set for `semi`: everything the agent needs to look around and
+ * nothing that changes the machine. Chosen so the mode is safe to expose without
+ * further configuration — widening it is a deliberate act.
+ */
+export const READ_ONLY_TOOLS = ["Read", "Glob", "Grep", "WebFetch", "WebSearch", "TodoWrite"];
+
+/** Mode suffix on an advertised model id. */
+const MODE_SUFFIX: Record<Mode, string> = { oracle: "", harness: "-harness", semi: "-semi" };
+
 function defaultModels(defaults: Config["defaults"]): ModelEntry[] {
   const entries: ModelEntry[] = [];
   for (const base of BASE_MODELS) {
+    for (const mode of ["oracle", "harness", "semi"] as Mode[]) {
+      entries.push({
+        id: base.model + MODE_SUFFIX[mode],
+        model: base.model,
+        mode,
+        effort: null,
+        contextWindow: base.context,
+        ownedBy: "local",
+      });
+    }
+  }
+  // Convenience aliases so a client can just ask for the mode by name.
+  for (const mode of ["oracle", "harness", "semi"] as Mode[]) {
     entries.push({
-      id: base.model,
-      model: base.model,
-      mode: "oracle",
-      effort: null,
-      contextWindow: base.context,
-      ownedBy: "local",
-    });
-    entries.push({
-      id: `${base.model}-harness`,
-      model: base.model,
-      mode: "harness",
-      effort: null,
-      contextWindow: base.context,
+      id: mode,
+      model: defaults.model,
+      mode,
+      effort: defaults.effort,
+      contextWindow: 1_000_000,
       ownedBy: "local",
     });
   }
-  // Convenience aliases so a client can just ask for "oracle" or "harness".
-  entries.push({
-    id: "oracle",
-    model: defaults.model,
-    mode: "oracle",
-    effort: defaults.effort,
-    contextWindow: 1_000_000,
-    ownedBy: "local",
-  });
-  entries.push({
-    id: "harness",
-    model: defaults.model,
-    mode: "harness",
-    effort: defaults.effort,
-    contextWindow: 1_000_000,
-    ownedBy: "local",
-  });
   return entries;
 }
 
@@ -129,7 +158,29 @@ export function defaultConfig(): Config {
       activity: "reasoning",
       disableNonEssentialModelCalls: true,
     },
+    semi: {
+      workspaceRoot: join(projectRoot, "workspaces"),
+      allowedCwds: [],
+      // Nothing in the default tool set can write, so there is nothing to accept.
+      permissionMode: "default",
+      tools: [...READ_ONLY_TOOLS],
+      allowedTools: [],
+      disallowedTools: [],
+      dangerouslySkipPermissions: false,
+      appendSystemPrompt: null,
+      settingSources: "user,project,local",
+      activity: "reasoning",
+      disableNonEssentialModelCalls: true,
+      allowRequestTools: true,
+    },
     sessions: { max: 16, idleMs: 15 * 60_000, reuse: true, turnTimeoutMs: 20 * 60_000 },
+    usage: {
+      persist: true,
+      path: join(projectRoot, "data", "usage.db"),
+      flushMs: 2000,
+      retentionDays: 90,
+      memoryMax: 5000,
+    },
     dashboard: { localAutoAuth: true },
     models: defaultModels(defaults),
     logLevel: "info",
@@ -174,10 +225,15 @@ export function loadConfig(configPath?: string): Config {
       cfg.models = (parsed["models"] as Array<Record<string, unknown>>).map((m) => ({
         id: String(m["id"]),
         model: String(m["model"] ?? cfg.defaults.model),
-        mode: (m["mode"] === "harness" ? "harness" : "oracle") as Mode,
+        mode: isMode(m["mode"]) ? m["mode"] : "oracle",
         effort: m["effort"] == null ? null : String(m["effort"]),
         contextWindow: Number(m["contextWindow"] ?? 200_000),
         ownedBy: String(m["ownedBy"] ?? "local"),
+        tools: Array.isArray(m["tools"]) ? m["tools"].map(String) : undefined,
+        allowedTools: Array.isArray(m["allowedTools"]) ? m["allowedTools"].map(String) : undefined,
+        disallowedTools: Array.isArray(m["disallowedTools"])
+          ? m["disallowedTools"].map(String)
+          : undefined,
       }));
     } else if (isRecord(parsed["defaults"])) {
       cfg.models = defaultModels(cfg.defaults);
@@ -189,7 +245,9 @@ export function loadConfig(configPath?: string): Config {
   if (tokens) cfg.auth.tokens = tokens;
   if (process.env["BRIDGE_HOST"]) cfg.server.host = process.env["BRIDGE_HOST"];
   if (process.env["BRIDGE_PORT"]) cfg.server.port = Number(process.env["BRIDGE_PORT"]);
-  if (process.env["BRIDGE_MODE"]) cfg.defaults.mode = process.env["BRIDGE_MODE"] as Mode;
+  if (isMode(process.env["BRIDGE_MODE"])) cfg.defaults.mode = process.env["BRIDGE_MODE"];
+  if (process.env["BRIDGE_USAGE_DB"]) cfg.usage.path = process.env["BRIDGE_USAGE_DB"];
+  if (process.env["BRIDGE_NO_USAGE_DB"] === "1") cfg.usage.persist = false;
   if (process.env["BRIDGE_MODEL"]) cfg.defaults.model = process.env["BRIDGE_MODEL"];
   if (process.env["BRIDGE_CLAUDE_BIN"]) cfg.claude.binary = process.env["BRIDGE_CLAUDE_BIN"];
   if (process.env["BRIDGE_LOG_LEVEL"]) cfg.logLevel = process.env["BRIDGE_LOG_LEVEL"] as LogLevel;
@@ -208,8 +266,13 @@ export function resolveModel(cfg: Config, requested: string | undefined): ModelE
   if (!entry) {
     // Unknown ids fall back to the default rather than erroring: clients like to
     // send whatever model name they were configured with, and a hard 404 there
-    // is a worse experience than answering.
-    const mode: Mode = id.endsWith("-harness") ? "harness" : cfg.defaults.mode;
+    // is a worse experience than answering. A recognizable mode suffix is still
+    // honoured, so `whatever-semi` lands in semi rather than the default.
+    const mode: Mode = id.endsWith("-harness")
+      ? "harness"
+      : id.endsWith("-semi")
+        ? "semi"
+        : cfg.defaults.mode;
     entry = {
       id: id || cfg.defaults.model,
       model: cfg.defaults.model,

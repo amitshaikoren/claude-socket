@@ -3,3 +3,9 @@ workspaces/
 bridge.config.json
 .env
 *.log
+
+# Token usage history: local telemetry holding prompt previews, never committed.
+data/
+*.db
+*.db-wal
+*.db-shm

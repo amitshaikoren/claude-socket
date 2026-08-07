@@ -4,7 +4,7 @@ import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { startTestServer, authHeaders, testConfig, type TestServer } from "./helpers.ts";
+import { startTestServer, authHeaders, testConfig, testClass, type TestServer } from "./helpers.ts";
 import { buildSpawnPlan } from "../src/claude/args.ts";
 import { renderSeed } from "../src/claude/sessions.ts";
 
@@ -116,14 +116,7 @@ describe("CLI argument construction", () => {
   const cfg = testConfig();
 
   test("oracle mode strips the agent down to a completion endpoint", () => {
-    const plan = buildSpawnPlan(cfg, {
-      mode: "oracle",
-      model: "claude-sonnet-5",
-      systemPrompt: "be terse",
-      effort: null,
-      cwd: process.cwd(),
-      jsonSchema: null,
-    });
+    const plan = buildSpawnPlan(cfg, testClass({ systemPrompt: "be terse" }));
     const args = plan.args;
     assert.ok(args.includes("--print"));
     assert.ok(args.includes("--include-partial-messages"));
@@ -140,14 +133,16 @@ describe("CLI argument construction", () => {
   });
 
   test("harness mode keeps Claude Code intact and appends the client prompt", () => {
-    const plan = buildSpawnPlan(cfg, {
-      mode: "harness",
-      model: "claude-opus-5",
-      systemPrompt: "extra rules",
-      effort: "high",
-      cwd: mkdtempSync(join(tmpdir(), "bridge-cwd-")),
-      jsonSchema: null,
-    });
+    const plan = buildSpawnPlan(
+      cfg,
+      testClass({
+        mode: "harness",
+        model: "claude-opus-5",
+        systemPrompt: "extra rules",
+        effort: "high",
+        cwd: mkdtempSync(join(tmpdir(), "bridge-cwd-")),
+      }),
+    );
     const args = plan.args;
     assert.ok(!args.includes("--system-prompt-file"));
     assert.ok(args.includes("--append-system-prompt-file"));
@@ -163,14 +158,7 @@ describe("CLI argument construction", () => {
     const previous = process.env["ANTHROPIC_BASE_URL"];
     process.env["ANTHROPIC_BASE_URL"] = `http://127.0.0.1:${cfg.server.port}/v1`;
     try {
-      const plan = buildSpawnPlan(cfg, {
-        mode: "oracle",
-        model: "claude-sonnet-5",
-        systemPrompt: "",
-        effort: null,
-        cwd: process.cwd(),
-        jsonSchema: null,
-      });
+      const plan = buildSpawnPlan(cfg, testClass());
       assert.ok(plan.unsetEnv.includes("ANTHROPIC_BASE_URL"));
     } finally {
       if (previous === undefined) delete process.env["ANTHROPIC_BASE_URL"];
@@ -182,14 +170,7 @@ describe("CLI argument construction", () => {
     const previous = process.env["ANTHROPIC_BASE_URL"];
     process.env["ANTHROPIC_BASE_URL"] = "https://gateway.corp.example.com";
     try {
-      const plan = buildSpawnPlan(cfg, {
-        mode: "oracle",
-        model: "claude-sonnet-5",
-        systemPrompt: "",
-        effort: null,
-        cwd: process.cwd(),
-        jsonSchema: null,
-      });
+      const plan = buildSpawnPlan(cfg, testClass());
       assert.deepEqual(plan.unsetEnv, []);
     } finally {
       if (previous === undefined) delete process.env["ANTHROPIC_BASE_URL"];
@@ -199,14 +180,7 @@ describe("CLI argument construction", () => {
 
   test("a JSON schema is forwarded to the CLI", () => {
     const schema = { type: "object", properties: { name: { type: "string" } } };
-    const plan = buildSpawnPlan(cfg, {
-      mode: "oracle",
-      model: "claude-sonnet-5",
-      systemPrompt: "",
-      effort: null,
-      cwd: process.cwd(),
-      jsonSchema: JSON.stringify(schema),
-    });
+    const plan = buildSpawnPlan(cfg, testClass({ jsonSchema: JSON.stringify(schema) }));
     assert.deepEqual(JSON.parse(plan.args[plan.args.indexOf("--json-schema") + 1]!), schema);
   });
 });
