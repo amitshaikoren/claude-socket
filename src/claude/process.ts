@@ -153,6 +153,9 @@ export class ClaudeProcess {
     /** Final output counts from message_delta, which may arrive either side of
      *  the `assistant` record that creates the step. */
     finalOutput: new Map<string, number>(),
+    /** Whether any text has streamed this turn, which is what decides whether
+     *  the next text block needs a separator ahead of it. See `#textSeparator`. */
+    textSeen: false,
   };
   #exitInfo: { code: number | null; signal: string | null } | null = null;
   #readyResolve: (() => void) | null = null;
@@ -321,6 +324,13 @@ export class ClaudeProcess {
         if (blockType === "text" || blockType === "thinking") {
           state.openBlock = blockType;
           q.push({ kind: "block_start", blockType });
+          // The accumulator joins text blocks with a blank line; the wire has no
+          // separator of its own. Synthesizing it here is what lets a consumer
+          // reassemble the deltas into the same string `#handleAssistant`
+          // builds, without either dialect knowing the rule.
+          if (blockType === "text" && state.textSeen) {
+            q.push({ kind: "delta", blockType: "text", text: "\n\n" });
+          }
         }
         break;
       }
@@ -328,6 +338,9 @@ export class ClaudeProcess {
         const delta = isRecord(event["delta"]) ? event["delta"] : null;
         if (!delta) break;
         if (delta["type"] === "text_delta" && typeof delta["text"] === "string") {
+          // Empty blocks contribute nothing to `state.text` and so earn no
+          // separator either — hence "text seen", not "block seen".
+          if (delta["text"]) state.textSeen = true;
           q.push({ kind: "delta", blockType: "text", text: delta["text"] });
         } else if (delta["type"] === "thinking_delta" && typeof delta["thinking"] === "string") {
           q.push({ kind: "delta", blockType: "thinking", text: delta["thinking"] });
@@ -362,6 +375,8 @@ export class ClaudeProcess {
     for (const raw of message["content"]) {
       if (!isRecord(raw)) continue;
       if (raw["type"] === "text" && typeof raw["text"] === "string") {
+        // Changing this join changes what a streaming client reassembles: the
+        // separator is mirrored onto the delta stream at content_block_start.
         state.text += (state.text ? "\n\n" : "") + raw["text"];
       } else if (raw["type"] === "thinking" && typeof raw["thinking"] === "string") {
         state.thinking += raw["thinking"];
@@ -582,6 +597,7 @@ export class ClaudeProcess {
       steps: new Map(),
       streamingId: null,
       finalOutput: new Map(),
+      textSeen: false,
     };
     const queue = new EventQueue();
     this.#queue = queue;

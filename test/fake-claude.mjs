@@ -118,11 +118,49 @@ async function respond(prompt) {
   /** Re-emit the message just sent, verbatim — what the real CLI does. */
   const replay = (content) => send(call, content);
 
-  emit({
-    type: "stream_event",
-    event: { type: "content_block_start", index: 0, content_block: { type: "text", text: "" } },
-    parent_tool_use_id: null,
-  });
+  const openBlock = (index) =>
+    emit({
+      type: "stream_event",
+      event: { type: "content_block_start", index, content_block: { type: "text", text: "" } },
+      parent_tool_use_id: null,
+    });
+  const blockDelta = (index, text) =>
+    emit({
+      type: "stream_event",
+      event: { type: "content_block_delta", index, delta: { type: "text_delta", text } },
+      parent_tool_use_id: null,
+    });
+  const stopBlock = (index) =>
+    emit({ type: "stream_event", event: { type: "content_block_stop", index }, parent_tool_use_id: null });
+
+  // A turn whose reply arrives as two text blocks. The CLI joins them with a
+  // blank line when it accumulates; the deltas carry no separator, which is the
+  // divergence the streaming reassembly has to close.
+  if (process.env.FAKE_TEXT_BLOCKS === "2") {
+    const [first, second] = ["block one", `block two: ${prompt}`];
+    for (const [index, part] of [first, second].entries()) {
+      openBlock(index);
+      for (const piece of part.match(/.{1,7}/gs) ?? []) blockDelta(index, piece);
+      stopBlock(index);
+    }
+    assistant([
+      { type: "text", text: first },
+      { type: "text", text: second },
+    ]);
+    emit({
+      type: "result",
+      subtype: "success",
+      is_error: false,
+      stop_reason: "end_turn",
+      num_turns: turn,
+      total_cost_usd: 0.0001 * turn,
+      usage: stepUsage(1),
+      result: `${first}\n\n${second}`,
+    });
+    return;
+  }
+
+  openBlock(0);
 
   if (process.env.FAKE_TOOL_USE === "1") {
     // A tool loop: one call asks, the next answers. Two billed calls, which is

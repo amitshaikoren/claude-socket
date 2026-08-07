@@ -135,8 +135,34 @@ Auth accepts `Authorization: Bearer`, `x-api-key`, or `?api_key=`, compared in c
 | `X-Claude-Disallowed-Tools` | Comma-separated tools to remove on top of the configured set. |
 | `X-Claude-Session` | Pin a specific CLI session, bypassing prefix matching. |
 | `X-Claude-Max-Budget-Usd` | Per-turn spend ceiling. |
+| `X-Claude-Authoritative-Text` | Streaming only: add the authoritative reply text to the terminal frame. See below. |
 
 Streaming responses echo `x-claude-session`, so a client can pin follow-ups explicitly.
+
+### Grounding on a streamed reply
+
+A streamed reply is reassembled from deltas. The bridge takes care to make that
+reassembly match what the same turn returns non-streamed — block separators are
+restored, partial `<tool_call>` tags are withheld and released at the end — but
+the two can only ever be *aligned*, not proven equal: a CLI record whose text
+never arrived as deltas is unrecoverable from the wire. `test/stream-parity.test.ts`
+pins the alignment so a future CLI change fails a test instead of silently
+shipping a different string.
+
+If you are grounding or auditing the output rather than displaying it, ask for
+the authoritative text instead of reassembling one. Set
+`X-Claude-Authoritative-Text: 1` (or, for OpenAI clients,
+`stream_options.include_authoritative_text`) and the terminal frame carries it:
+
+```jsonc
+// OpenAI: a trailer frame with no choices, like the usage frame
+{ "object": "chat.completion.chunk", "choices": [], "claude_bridge": { "text": "…" } }
+
+// Anthropic: alongside usage on message_delta
+{ "type": "message_delta", "delta": {…}, "usage": {…}, "claude_bridge": { "text": "…" } }
+```
+
+It is off by default because it repeats the whole reply on the wire.
 
 ## Configuration
 

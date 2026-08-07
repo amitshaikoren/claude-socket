@@ -11,6 +11,16 @@ import {
   type ToolPolicy,
 } from "./types.ts";
 
+/**
+ * Whether the caller asked for the authoritative reply text on the terminal
+ * stream frame. Off by default: it duplicates the whole reply on the wire, and
+ * only a client that grounds or audits the output needs it.
+ */
+export function wantsAuthoritativeText(headers: IncomingHttpHeaders): boolean {
+  const raw = header(headers, "x-claude-authoritative-text");
+  return raw !== null && raw !== "0" && raw !== "false";
+}
+
 function header(headers: IncomingHttpHeaders, name: string): string | null {
   const value = headers[name];
   if (Array.isArray(value)) return value[0] ?? null;

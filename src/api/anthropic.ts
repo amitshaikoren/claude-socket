@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import type { Ctx } from "../http/context.ts";
 import { sendJson } from "../http/context.ts";
 import { SseWriter } from "../http/sse.ts";
-import { activityMode, resolveTarget } from "../core/resolve.ts";
+import { activityMode, resolveTarget, wantsAuthoritativeText } from "../core/resolve.ts";
 import { formatToolResult, formatToolUse } from "../core/activity.ts";
 import { recordTurn } from "../core/record.ts";
 import { billed, peakContext, type Step } from "../core/usage.ts";
@@ -13,7 +13,7 @@ import {
   parseAnthropicTools,
   renderAssistantCalls,
   renderToolResult,
-  ToolCallScanner,
+  ReplyStream,
   type ParsedCall,
 } from "../core/tools.ts";
 import {
@@ -356,7 +356,10 @@ export async function handleMessages(ctx: Ctx): Promise<void> {
   let failed: { type: string; message: string } | null = null;
   let calls: ParsedCall[] = [];
   let replyText = "";
-  const scanner = tools.length > 0 ? new ToolCallScanner() : null;
+  // Reassembles the reply so a streaming client ends up with the same string a
+  // non-streaming one gets: half-written <tool_call> tags withheld, trimmed the
+  // way extractToolCalls trims, tail released by finish() below.
+  const reply = new ReplyStream(tools.length > 0);
 
   try {
     for (;;) {
@@ -368,8 +371,7 @@ export async function handleMessages(ctx: Ctx): Promise<void> {
       switch (event.kind) {
         case "delta":
           if (event.blockType === "text") {
-            const safe = scanner ? scanner.push(event.text) : event.text;
-            if (safe) writer.delta("text", safe);
+            writer.delta("text", reply.push(event.text));
           } else if (activity === "reasoning") {
             writer.delta("thinking", event.text);
           }
@@ -388,7 +390,11 @@ export async function handleMessages(ctx: Ctx): Promise<void> {
           usage = event.usage;
           steps = event.steps;
           stopReason = event.stopReason;
-          if (scanner) {
+          // The completed text is authoritative for what gets recorded and for
+          // the tool calls; the delta stream can only ever be a best-effort
+          // reassembly of it, since a block whose deltas never arrived is
+          // unrecoverable from the wire.
+          if (tools.length > 0) {
             const extracted = extractToolCalls(event.text);
             calls = extracted.calls;
             replyText = extracted.text;
@@ -406,6 +412,9 @@ export async function handleMessages(ctx: Ctx): Promise<void> {
     }
   } finally {
     if (!sse.closed) {
+      // Release the held tail while the text block is still open; closeBlock()
+      // below would otherwise strand it.
+      if (!failed) writer.delta("text", reply.finish());
       writer.closeBlock();
       if (failed) {
         sse.send({ type: "error", error: { type: failed.type, message: failed.message } }, "error");
@@ -419,6 +428,11 @@ export async function handleMessages(ctx: Ctx): Promise<void> {
               stop_sequence: null,
             },
             usage: usagePayload(usage, steps),
+            // Opt-in: the string the bridge treats as authoritative, for a
+            // client that grounds on the reply rather than just displaying it.
+            ...(wantsAuthoritativeText(ctx.req.headers)
+              ? { claude_bridge: { text: replyText } }
+              : {}),
           },
           "message_delta",
         );

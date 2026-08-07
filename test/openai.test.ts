@@ -1,6 +1,6 @@
 import { test, describe, before, after } from "node:test";
 import assert from "node:assert/strict";
-import { startTestServer, authHeaders, readSse, type TestServer } from "./helpers.ts";
+import { startTestServer, testConfig, authHeaders, readSse, type TestServer } from "./helpers.ts";
 
 describe("OpenAI dialect", () => {
   let server: TestServer;
@@ -126,5 +126,139 @@ describe("OpenAI dialect", () => {
     assert.equal(res.status, 404);
     const body = (await res.json()) as { error: { type: string } };
     assert.equal(body.error.type, "not_found_error");
+  });
+});
+
+/**
+ * A streamed reply and a non-streamed one are the same turn rendered two ways.
+ * Any string a client can reassemble from the deltas has to match what the
+ * non-streaming path would have returned — these are the two ways that failed.
+ */
+describe("OpenAI streaming matches non-streaming", () => {
+  let server: TestServer;
+
+  before(async () => {
+    server = await startTestServer();
+  });
+  after(async () => server.close());
+
+  const post = (body: unknown) =>
+    fetch(`${server.base}/v1/chat/completions`, {
+      method: "POST",
+      headers: authHeaders(),
+      body: JSON.stringify(body),
+    });
+
+  const NOOP_TOOL = {
+    type: "function",
+    function: { name: "noop", description: "does nothing", parameters: { type: "object", properties: {} } },
+  };
+
+  async function streamedText(body: Record<string, unknown>): Promise<string> {
+    const res = await post({ ...body, stream: true });
+    assert.equal(res.status, 200);
+    const payloads = await readSse(res);
+    return payloads
+      .slice(0, -1)
+      .map((p) => JSON.parse(p) as Record<string, any>)
+      .filter((c) => c.choices?.[0]?.delta?.content)
+      .map((c) => c.choices[0].delta.content as string)
+      .join("");
+  }
+
+  test("keeps a trailing character that could have started a tool_call tag", async () => {
+    // "<" is a one-character prefix of "<tool_call>", so the scanner holds it
+    // back. Without a flush at end of stream it is never released.
+    const text = await streamedText({
+      model: "oracle",
+      messages: [{ role: "user", content: "AB<" }],
+      tools: [NOOP_TOOL],
+    });
+    assert.match(text, /: AB<$/, "the held tail reached the client");
+  });
+
+  test("restores the blank line between two text blocks", async () => {
+    const cfg = testConfig();
+    cfg.claude.env = { FAKE_TEXT_BLOCKS: "2" };
+    const blocks = await startTestServer(cfg);
+    try {
+      const body = { model: "oracle", messages: [{ role: "user", content: "hi" }] };
+      const send = (b: unknown) =>
+        fetch(`${blocks.base}/v1/chat/completions`, {
+          method: "POST",
+          headers: authHeaders(),
+          body: JSON.stringify(b),
+        });
+
+      const plain = (await (await send(body)).json()) as {
+        choices: Array<{ message: { content: string } }>;
+      };
+      const whole = plain.choices[0]!.message.content;
+      assert.equal(whole, "block one\n\nblock two: hi");
+
+      const payloads = await readSse(await send({ ...body, stream: true }));
+      const streamed = payloads
+        .slice(0, -1)
+        .map((p) => JSON.parse(p) as Record<string, any>)
+        .filter((c) => c.choices?.[0]?.delta?.content)
+        .map((c) => c.choices[0].delta.content as string)
+        .join("");
+      assert.equal(streamed, whole, "the delta stream dropped the block separator");
+    } finally {
+      await blocks.close();
+    }
+  });
+});
+
+/**
+ * The delta stream is an alignment with `done.text`, not a proof of equality.
+ * A client that grounds on the reply can ask for the string the bridge itself
+ * treats as authoritative, rather than reassembling one and hoping.
+ */
+describe("OpenAI authoritative text trailer", () => {
+  let server: TestServer;
+
+  before(async () => {
+    server = await startTestServer();
+  });
+  after(async () => server.close());
+
+  const stream = (body: unknown, headers = authHeaders()) =>
+    fetch(`${server.base}/v1/chat/completions`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify(body),
+    });
+
+  const trailer = async (res: Response): Promise<string | undefined> => {
+    const payloads = await readSse(res);
+    const frame = payloads
+      .slice(0, -1)
+      .map((p) => JSON.parse(p) as Record<string, any>)
+      .find((c) => c.claude_bridge);
+    return frame?.claude_bridge?.text as string | undefined;
+  };
+
+  const body = {
+    model: "oracle",
+    messages: [{ role: "user", content: "ground me" }],
+    stream: true,
+  };
+
+  test("is absent unless asked for", async () => {
+    assert.equal(await trailer(await stream(body)), undefined);
+  });
+
+  test("stream_options opts in", async () => {
+    const res = await stream({ ...body, stream_options: { include_authoritative_text: true } });
+    assert.match((await trailer(res)) ?? "", /: ground me$/);
+  });
+
+  test("the header opts in too, for clients that cannot set stream_options", async () => {
+    const res = await stream(body, {
+      ...authHeaders(),
+      "x-claude-authoritative-text": "1",
+    });
+    assert.match((await trailer(res)) ?? "", /: ground me$/);
   });
 });

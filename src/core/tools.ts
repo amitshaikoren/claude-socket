@@ -226,6 +226,77 @@ export class ToolCallScanner {
   }
 }
 
+/**
+ * The streaming counterpart to `extractToolCalls`, for reassembling a reply as
+ * it arrives.
+ *
+ * `ToolCallScanner` holds back a trailing run that could be the start of a tag,
+ * and `extractToolCalls` trims. Neither is resolvable until the stream ends, so
+ * `finish()` must be called — whatever it returns is the tail of the reply, and
+ * dropping it truncates the answer.
+ *
+ * Trimming and tag-stripping apply only when `scanning`, because the callers
+ * likewise only run `extractToolCalls` when the request declared tools.
+ *
+ * Block separators are not handled here: they arrive as ordinary text deltas
+ * synthesized in `claude/process.ts`, next to the accumulator whose join rule
+ * they mirror. Passing them through the scanner is what makes the ordering come
+ * out right — a held `<` releases as `<\n\n` rather than being reordered. The
+ * exception is a tool call left open across a block boundary, where the
+ * separator is absorbed into the call body instead: `state.text` puts it inside
+ * the call region too, so matching the authoritative text and parsing the call
+ * want opposite things there. Unresolvable, pathological, and the authoritative
+ * text is what gets recorded either way.
+ */
+export class ReplyStream {
+  #scanner: ToolCallScanner | null;
+  /** Trailing whitespace, withheld in case it turns out to be the end. */
+  #held = "";
+  /** Whether any non-whitespace has been emitted, i.e. leading trim is done. */
+  #seen = false;
+
+  constructor(scanning: boolean) {
+    this.#scanner = scanning ? new ToolCallScanner() : null;
+  }
+
+  /** Feed a chunk; returns the text that is safe to forward. */
+  push(text: string): string {
+    return this.#shape(this.#scanner ? this.#scanner.push(text) : text);
+  }
+
+  /** Flush the tail. Whatever this returns still belongs to the reply. */
+  finish(): string {
+    const tail = this.#scanner ? this.#scanner.finish().text : "";
+    const out = this.#shape(tail);
+    this.#held = ""; // Trailing whitespace: dropped, matching `.trim()`.
+    return out;
+  }
+
+  /**
+   * Apply the same leading/trailing trim `extractToolCalls` does, without
+   * needing the whole reply: leading whitespace is dropped outright, trailing
+   * whitespace is held until something non-blank follows it.
+   */
+  #shape(safe: string): string {
+    if (!safe) return "";
+    if (!this.#scanner) return safe; // No tools, no trim — the callers don't either.
+
+    let text = this.#held + safe;
+    this.#held = "";
+    if (!this.#seen) {
+      text = text.replace(/^\s+/, "");
+      if (!text) return "";
+      this.#seen = true;
+    }
+    const trailing = /\s+$/.exec(text);
+    if (trailing) {
+      this.#held = trailing[0];
+      text = text.slice(0, text.length - trailing[0].length);
+    }
+    return text;
+  }
+}
+
 /** One-shot parse of a complete reply. */
 export function extractToolCalls(text: string): { text: string; calls: ParsedCall[] } {
   const scanner = new ToolCallScanner();

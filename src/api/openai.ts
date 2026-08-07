@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import type { Ctx } from "../http/context.ts";
 import { sendJson } from "../http/context.ts";
 import { SseWriter } from "../http/sse.ts";
-import { activityMode, resolveTarget } from "../core/resolve.ts";
+import { activityMode, resolveTarget, wantsAuthoritativeText } from "../core/resolve.ts";
 import { formatToolResult, formatToolUse } from "../core/activity.ts";
 import { recordTurn } from "../core/record.ts";
 import { billed, peakContext, type Step } from "../core/usage.ts";
@@ -13,7 +13,7 @@ import {
   parseOpenAiTools,
   renderAssistantCalls,
   renderToolResult,
-  ToolCallScanner,
+  ReplyStream,
   type ParsedCall,
 } from "../core/tools.ts";
 import {
@@ -214,6 +214,12 @@ export async function handleChatCompletions(ctx: Ctx): Promise<void> {
   const stream = body["stream"] === true;
   const streamOptions = isRecord(body["stream_options"]) ? body["stream_options"] : null;
   const includeUsage = streamOptions?.["include_usage"] === true;
+  // The delta stream is a best-effort reassembly of `done.text`; a client that
+  // grounds on what the model said wants the string the bridge itself treats as
+  // authoritative. Opt-in, since it repeats the whole reply on the wire.
+  const includeAuthoritative =
+    streamOptions?.["include_authoritative_text"] === true ||
+    wantsAuthoritativeText(ctx.req.headers);
   const promptPreview = textOfBlocks(messages[messages.length - 1]?.content ?? []);
 
   const activity = activityMode(ctx.cfg, target.cls.mode);
@@ -342,9 +348,10 @@ export async function handleChatCompletions(ctx: Ctx): Promise<void> {
   let calls: ParsedCall[] = [];
   let replyText = "";
 
-  // With tools in play, text is filtered so a half-written <tool_call> tag
-  // never reaches the client.
-  const scanner = tools.length > 0 ? new ToolCallScanner() : null;
+  // Reassembles the reply so a streaming client ends up with the same string a
+  // non-streaming one gets: half-written <tool_call> tags withheld, trimmed the
+  // way extractToolCalls trims, tail released by finish() below.
+  const reply = new ReplyStream(tools.length > 0);
 
   const reason = (text: string) => {
     if (activity === "reasoning") chunk({ reasoning_content: text });
@@ -361,7 +368,7 @@ export async function handleChatCompletions(ctx: Ctx): Promise<void> {
       switch (event.kind) {
         case "delta":
           if (event.blockType === "text") {
-            const safe = scanner ? scanner.push(event.text) : event.text;
+            const safe = reply.push(event.text);
             if (safe) chunk({ content: safe });
           } else if (activity === "reasoning") {
             chunk({ reasoning_content: event.text });
@@ -377,9 +384,11 @@ export async function handleChatCompletions(ctx: Ctx): Promise<void> {
           usage = event.usage;
           steps = event.steps;
           stopReason = event.stopReason;
-          // The completed text is authoritative; re-parse it rather than trust
-          // the reassembled delta stream.
-          if (scanner) {
+          // The completed text is authoritative for what gets recorded and for
+          // the tool calls; the delta stream can only ever be a best-effort
+          // reassembly of it, since a block whose deltas never arrived is
+          // unrecoverable from the wire.
+          if (tools.length > 0) {
             const extracted = extractToolCalls(event.text);
             calls = extracted.calls;
             replyText = extracted.text;
@@ -400,6 +409,9 @@ export async function handleChatCompletions(ctx: Ctx): Promise<void> {
       if (failed && failed.kind === "error") {
         sse.send({ error: { message: failed.message, type: failed.type, code: failed.status } });
       } else {
+        // Release what the scanner was holding, before the terminal chunks.
+        const tail = reply.finish();
+        if (tail) chunk({ content: tail });
         calls.forEach((call, index) => {
           chunk({
             tool_calls: [
@@ -422,6 +434,17 @@ export async function handleChatCompletions(ctx: Ctx): Promise<void> {
           model: advertised,
           choices: [],
           usage: usagePayload(usage, steps),
+        });
+      }
+      if (includeAuthoritative && !failed) {
+        // Same trailer shape as the usage frame: no choices, one extra key.
+        sse.send({
+          id,
+          object: "chat.completion.chunk",
+          created,
+          model: advertised,
+          choices: [],
+          claude_bridge: { text: replyText },
         });
       }
       sse.send("[DONE]");

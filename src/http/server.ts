@@ -22,7 +22,7 @@ const CORS_HEADERS: Record<string, string> = {
   "access-control-allow-headers":
     "authorization, content-type, x-api-key, anthropic-version, anthropic-beta, " +
     "x-claude-mode, x-claude-effort, x-claude-cwd, x-claude-session, x-claude-max-budget-usd, " +
-    "x-claude-tools, x-claude-disallowed-tools",
+    "x-claude-tools, x-claude-disallowed-tools, x-claude-authoritative-text",
   "access-control-expose-headers": "x-claude-session, x-ratelimit-status, x-ratelimit-reset",
 };
 
