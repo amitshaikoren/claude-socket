@@ -2,8 +2,10 @@ import { randomUUID } from "node:crypto";
 import type { Ctx } from "../http/context.ts";
 import { sendJson } from "../http/context.ts";
 import { SseWriter } from "../http/sse.ts";
-import { resolveTarget } from "../core/resolve.ts";
+import { activityMode, resolveTarget } from "../core/resolve.ts";
 import { formatToolResult, formatToolUse } from "../core/activity.ts";
+import { recordTurn } from "../core/record.ts";
+import { billed, peakContext, type Step } from "../core/usage.ts";
 import {
   buildToolPrompt,
   extractToolCalls,
@@ -14,7 +16,6 @@ import {
   ToolCallScanner,
   type ParsedCall,
 } from "../core/tools.ts";
-import { preview, telemetry } from "../core/telemetry.ts";
 import {
   BridgeError,
   emptyUsage,
@@ -143,15 +144,40 @@ function finishReason(stopReason: string): string {
   return "stop";
 }
 
-function usagePayload(usage: Usage): Record<string, unknown> {
+/**
+ * OpenAI's usage shape, plus the numbers this server actually knows.
+ *
+ * `prompt_tokens` stays inclusive of cache reads, because that is what an OpenAI
+ * client means by the field and clients do arithmetic on it. The extra keys are
+ * non-standard and ignored by every client that does not want them:
+ * `billed_tokens` is the headline (input + cache creation + output, excluding
+ * replayed cache reads), and `steps` says how many model calls the turn took —
+ * which for an agentic turn is the difference between one request and thirty.
+ */
+function usagePayload(usage: Usage, steps: Step[] = []): Record<string, unknown> {
   const prompt = usage.inputTokens + usage.cacheReadTokens + usage.cacheCreationTokens;
   return {
     prompt_tokens: prompt,
     completion_tokens: usage.outputTokens,
     total_tokens: prompt + usage.outputTokens,
-    prompt_tokens_details: { cached_tokens: usage.cacheReadTokens },
-    // Not an OpenAI field, but the number people actually want from this server.
+    prompt_tokens_details: {
+      cached_tokens: usage.cacheReadTokens,
+      cache_creation_tokens: usage.cacheCreationTokens,
+    },
     cost_usd: Number(usage.costUsd.toFixed(6)),
+    billed_tokens: billed(usage),
+    peak_context_tokens: peakContext(steps),
+    steps: steps.length,
+    step_usage: steps.map((step) => ({
+      index: step.index,
+      model: step.model,
+      input_tokens: step.usage.inputTokens,
+      output_tokens: step.usage.outputTokens,
+      cache_read_input_tokens: step.usage.cacheReadTokens,
+      cache_creation_input_tokens: step.usage.cacheCreationTokens,
+      billed_tokens: billed(step.usage),
+      tools: step.tools.map((t) => t.name),
+    })),
   };
 }
 
@@ -190,7 +216,8 @@ export async function handleChatCompletions(ctx: Ctx): Promise<void> {
   const includeUsage = streamOptions?.["include_usage"] === true;
   const promptPreview = textOfBlocks(messages[messages.length - 1]?.content ?? []);
 
-  const activity = target.cls.mode === "harness" ? ctx.cfg.harness.activity : "off";
+  const activity = activityMode(ctx.cfg, target.cls.mode);
+  const startedAt = Date.now();
   const events = ctx.sessions.run(
     {
       cls: target.cls,
@@ -212,12 +239,15 @@ export async function handleChatCompletions(ctx: Ctx): Promise<void> {
     throw new BridgeError(err.status, err.type, err.message);
   }
 
-  const sessionId = !first.done && first.value.kind === "session" ? first.value.sessionId : "";
+  const session = !first.done && first.value.kind === "session" ? first.value : null;
+  const sessionId = session?.sessionId ?? "";
+  const reused = session?.reused ?? false;
 
   if (!stream) {
     let text = "";
     let reasoning = "";
     let usage = emptyUsage();
+    let steps: Step[] = [];
     let stopReason = "end_turn";
 
     for (;;) {
@@ -233,6 +263,7 @@ export async function handleChatCompletions(ctx: Ctx): Promise<void> {
         text = event.text;
         reasoning = event.thinking + reasoning;
         usage = event.usage;
+        steps = event.steps;
         stopReason = event.stopReason;
       }
     }
@@ -255,19 +286,21 @@ export async function handleChatCompletions(ctx: Ctx): Promise<void> {
       }));
     }
 
-    telemetry.emit("turn", {
+    recordTurn(ctx.store, {
+      startedAt,
       sessionId,
       dialect: "openai",
-      model: advertised,
       mode: target.cls.mode,
+      model: target.cls.model,
+      advertisedModel: advertised,
       stream: false,
-      inputTokens: usage.inputTokens,
-      outputTokens: usage.outputTokens,
-      cacheReadTokens: usage.cacheReadTokens,
-      costUsd: usage.costUsd,
-      toolCalls: calls.length,
-      prompt: preview(promptPreview),
-      reply: preview(text || calls.map((c) => `${c.name}(${c.argumentsJson})`).join(" ")),
+      cwd: target.cls.cwd,
+      reused,
+      usage,
+      steps,
+      clientToolCalls: calls.length,
+      prompt: promptPreview,
+      reply: text || calls.map((c) => `${c.name}(${c.argumentsJson})`).join(" "),
     });
 
     sendJson(ctx.res, 200, {
@@ -284,7 +317,7 @@ export async function handleChatCompletions(ctx: Ctx): Promise<void> {
           finish_reason: calls.length > 0 ? "tool_calls" : finishReason(stopReason),
         },
       ],
-      usage: usagePayload(usage),
+      usage: usagePayload(usage, steps),
     });
     return;
   }
@@ -303,6 +336,7 @@ export async function handleChatCompletions(ctx: Ctx): Promise<void> {
   chunk({ role: "assistant", content: "" });
 
   let usage = emptyUsage();
+  let steps: Step[] = [];
   let stopReason = "end_turn";
   let failed: TurnEvent | null = null;
   let calls: ParsedCall[] = [];
@@ -341,6 +375,7 @@ export async function handleChatCompletions(ctx: Ctx): Promise<void> {
           break;
         case "done":
           usage = event.usage;
+          steps = event.steps;
           stopReason = event.stopReason;
           // The completed text is authoritative; re-parse it rather than trust
           // the reassembled delta stream.
@@ -386,43 +421,51 @@ export async function handleChatCompletions(ctx: Ctx): Promise<void> {
           created,
           model: advertised,
           choices: [],
-          usage: usagePayload(usage),
+          usage: usagePayload(usage, steps),
         });
       }
       sse.send("[DONE]");
       sse.end();
     }
 
-    telemetry.emit(failed ? "error" : "turn", {
+    recordTurn(ctx.store, {
+      startedAt,
       sessionId,
       dialect: "openai",
-      model: advertised,
       mode: target.cls.mode,
+      model: target.cls.model,
+      advertisedModel: advertised,
       stream: true,
-      inputTokens: usage.inputTokens,
-      outputTokens: usage.outputTokens,
-      cacheReadTokens: usage.cacheReadTokens,
-      costUsd: usage.costUsd,
-      toolCalls: calls.length,
-      prompt: preview(promptPreview),
-      reply: preview(replyText || calls.map((c) => `${c.name}(${c.argumentsJson})`).join(" ")),
-      message: failed && failed.kind === "error" ? failed.message : undefined,
+      cwd: target.cls.cwd,
+      reused,
+      usage,
+      steps,
+      clientToolCalls: calls.length,
+      prompt: promptPreview,
+      reply: replyText || calls.map((c) => `${c.name}(${c.argumentsJson})`).join(" "),
+      error: failed && failed.kind === "error" ? failed.message : null,
     });
   }
 }
 
 export function handleModels(ctx: Ctx): void {
   const created = Math.floor(Date.now() / 1000);
+  const cfg = ctx.cfg;
   sendJson(ctx.res, 200, {
     object: "list",
-    data: ctx.cfg.models.map((m) => ({
-      id: m.id,
-      object: "model",
-      created,
-      owned_by: m.ownedBy,
-      context_window: m.contextWindow,
-      // Non-standard, but it is the one thing a client of this server wants to know.
-      mode: m.mode,
-    })),
+    data: cfg.models.map((m) => {
+      const section = m.mode === "semi" ? cfg.semi : m.mode === "harness" ? cfg.harness : null;
+      return {
+        id: m.id,
+        object: "model",
+        created,
+        owned_by: m.ownedBy,
+        context_window: m.contextWindow,
+        // Non-standard, but the two things a client of this server wants to
+        // know: how much agent it gets, and which tools that agent may run.
+        mode: m.mode,
+        tools: m.tools !== undefined ? m.tools : (section?.tools ?? null),
+      };
+    }),
   });
 }

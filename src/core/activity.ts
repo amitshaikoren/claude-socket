@@ -16,7 +16,8 @@ function isRecord(v: unknown): v is Record<string, unknown> {
   return typeof v === "object" && v !== null && !Array.isArray(v);
 }
 
-function summarizeInput(input: unknown): string {
+/** The primary argument of a tool call, flattened to one short line. */
+export function summarizeToolInput(input: unknown): string {
   if (!isRecord(input)) return "";
   for (const key of PRIMARY_KEYS) {
     const value = input[key];
@@ -30,7 +31,7 @@ function summarizeInput(input: unknown): string {
 }
 
 export function formatToolUse(name: string, input: unknown): string {
-  const summary = summarizeInput(input);
+  const summary = summarizeToolInput(input);
   return summary ? `\n→ ${name}(${summary})\n` : `\n→ ${name}\n`;
 }
 

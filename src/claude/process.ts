@@ -11,6 +11,8 @@ import {
   type TurnEvent,
   type Usage,
 } from "../core/types.ts";
+import { rollUp, type Step, type StepTool } from "../core/usage.ts";
+import { summarizeToolInput } from "../core/activity.ts";
 
 /** Async queue that turns pushed events into an async iterable. */
 class EventQueue {
@@ -61,6 +63,16 @@ class EventQueue {
 
 function isRecord(v: unknown): v is Record<string, unknown> {
   return typeof v === "object" && v !== null && !Array.isArray(v);
+}
+
+/** A `tool_use` block, before its arguments are dropped for storage. */
+interface RequestedTool extends StepTool {
+  input: unknown;
+}
+
+/** Persisted form: the arguments are not kept, only a one-line summary. */
+function toStepTool(tool: RequestedTool): StepTool {
+  return { id: tool.id, name: tool.name, summary: tool.summary };
 }
 
 /** A one-event stream, for turns that fail before they can start. */
@@ -134,6 +146,13 @@ export class ClaudeProcess {
     text: "",
     thinking: "",
     openBlock: null as string | null,
+    /** One entry per billed model call, keyed by message id to survive restates. */
+    steps: new Map<string, Step>(),
+    /** Message currently streaming, so its message_delta can be attributed. */
+    streamingId: null as string | null,
+    /** Final output counts from message_delta, which may arrive either side of
+     *  the `assistant` record that creates the step. */
+    finalOutput: new Map<string, number>(),
   };
   #exitInfo: { code: number | null; signal: string | null } | null = null;
   #readyResolve: (() => void) | null = null;
@@ -277,6 +296,23 @@ export class ClaudeProcess {
     const state = this.#turnState;
 
     switch (event["type"]) {
+      // The `assistant` record carries the usage as it stood at message_start,
+      // where output_tokens is a placeholder (1-2) rather than a count. The real
+      // figure only lands in message_delta at the end of the message. Verified
+      // against the CLI's own transcript: a message the wire reported as out=2
+      // was actually 65. Missing this under-reports output by ~97%, and with it
+      // every tool's attributed request cost.
+      case "message_start": {
+        const message = isRecord(event["message"]) ? event["message"] : null;
+        state.streamingId = typeof message?.["id"] === "string" ? message["id"] : null;
+        break;
+      }
+      case "message_delta": {
+        const usage = isRecord(event["usage"]) ? event["usage"] : null;
+        if (!usage || !state.streamingId) break;
+        this.#applyFinalOutput(state.streamingId, num(usage["output_tokens"]));
+        break;
+      }
       case "content_block_start": {
         const index = num(event["index"]);
         const block = isRecord(event["content_block"]) ? event["content_block"] : null;
@@ -318,18 +354,112 @@ export class ClaudeProcess {
     const message = isRecord(msg["message"]) ? msg["message"] : null;
     if (!q || !message || !Array.isArray(message["content"])) return;
 
+    const state = this.#turnState;
+    const tools: RequestedTool[] = [];
+
     // The completed message is authoritative for accumulated text; deltas are
     // only used for live streaming. This avoids reassembling partial chunks.
     for (const raw of message["content"]) {
       if (!isRecord(raw)) continue;
       if (raw["type"] === "text" && typeof raw["text"] === "string") {
-        this.#turnState.text += (this.#turnState.text ? "\n\n" : "") + raw["text"];
+        state.text += (state.text ? "\n\n" : "") + raw["text"];
       } else if (raw["type"] === "thinking" && typeof raw["thinking"] === "string") {
-        this.#turnState.thinking += raw["thinking"];
+        state.thinking += raw["thinking"];
       } else if (raw["type"] === "tool_use") {
-        q.push({ kind: "tool_use", name: String(raw["name"] ?? "tool"), input: raw["input"] });
+        tools.push({
+          id: typeof raw["id"] === "string" ? raw["id"] : "",
+          name: String(raw["name"] ?? "tool"),
+          summary: summarizeToolInput(raw["input"]),
+          input: raw["input"],
+        });
       }
     }
+
+    // Only the calls this message actually contributes are announced, so a
+    // restated message never replays its tools into the client's stream.
+    for (const tool of this.#recordStep(msg, message, tools)) {
+      q.push({ kind: "tool_use", name: tool.name, input: tool.input });
+    }
+  }
+
+  /**
+   * Attach a final output count to its model call.
+   *
+   * message_delta and the `assistant` record arrive in no guaranteed order, so
+   * this both updates a step that already exists and remembers the figure for
+   * one that does not yet.
+   */
+  #applyFinalOutput(messageId: string, outputTokens: number): void {
+    if (outputTokens <= 0) return;
+    const state = this.#turnState;
+    state.finalOutput.set(messageId, outputTokens);
+    const step = state.steps.get(messageId);
+    if (step) step.usage.outputTokens = outputTokens;
+  }
+
+  /**
+   * Record one billed model call, and return the tool calls that were new.
+   *
+   * Every assistant message is a separate API request, so its `usage` block is
+   * the only place a per-call number exists — the CLI's final `result` reports
+   * just the turn aggregate.
+   *
+   * The CLI restates a message rather often: measured over real transcripts,
+   * 40% of assistant messages arrive twice under the same id, always with
+   * identical usage. So the first usage reading is kept and later ones dropped —
+   * summing them would double every figure downstream.
+   *
+   * Tools need more care than "keep the first", because a restate is not
+   * redundant. In the same sample, 119 restates carried tool calls the first
+   * sighting did not have (ignoring them would lose those calls) while 65
+   * repeated ids the first sighting already had (appending them would inflate
+   * every tool count). Deduping on the `tool_use` block id is right for both:
+   * every block observed carried one.
+   */
+  #recordStep(
+    msg: Record<string, unknown>,
+    message: Record<string, unknown>,
+    tools: RequestedTool[],
+  ): RequestedTool[] {
+    const state = this.#turnState;
+    const id =
+      (typeof message["id"] === "string" && message["id"]) ||
+      (typeof msg["uuid"] === "string" && msg["uuid"]) ||
+      `step_${state.steps.size + 1}`;
+
+    const existing = state.steps.get(id);
+    if (existing) {
+      const known = new Set(existing.tools.map((t) => t.id).filter(Boolean));
+      // A block with no id cannot be told apart from a repeat, so it is dropped
+      // rather than risk inflating the count.
+      const fresh = tools.filter((t) => t.id && !known.has(t.id));
+      existing.tools.push(...fresh.map(toStepTool));
+      return fresh;
+    }
+
+    const usage = isRecord(message["usage"]) ? message["usage"] : null;
+    const step: Step = {
+      messageId: id,
+      index: state.steps.size + 1,
+      model: typeof message["model"] === "string" ? message["model"] : this.cls.model,
+      usage: {
+        inputTokens: num(usage?.["input_tokens"]),
+        // message_delta wins: the snapshot on this record is a placeholder.
+        outputTokens: state.finalOutput.get(id) ?? num(usage?.["output_tokens"]),
+        cacheReadTokens: num(usage?.["cache_read_input_tokens"]),
+        cacheCreationTokens: num(usage?.["cache_creation_input_tokens"]),
+        // Cost is only ever reported for the turn as a whole; apportioning it
+        // per call would be a guess, so it stays zero here and is carried on
+        // the turn's own usage.
+        costUsd: 0,
+      },
+      tools: tools.map(toStepTool),
+      at: Date.now(),
+    };
+
+    state.steps.set(id, step);
+    this.#queue?.push({ kind: "step", step });
+    return tools;
   }
 
   #handleToolResults(msg: Record<string, unknown>): void {
@@ -361,7 +491,8 @@ export class ClaudeProcess {
   #handleResult(msg: Record<string, unknown>): void {
     const q = this.#queue;
     if (!q) return;
-    const usage = this.#extractUsage(msg);
+    const steps = [...this.#turnState.steps.values()];
+    const usage = this.#extractUsage(msg, steps);
     this.totalCostUsd += usage.costUsd;
     this.turns += 1;
 
@@ -383,21 +514,44 @@ export class ClaudeProcess {
         stopReason: String(msg["stop_reason"] ?? "end_turn"),
         text,
         thinking: state.thinking,
+        steps,
       });
     }
     q.close();
     this.#queue = null;
   }
 
-  #extractUsage(msg: Record<string, unknown>): Usage {
-    const usage = isRecord(msg["usage"]) ? msg["usage"] : {};
-    return {
-      inputTokens: num(usage["input_tokens"]),
-      outputTokens: num(usage["output_tokens"]),
-      cacheReadTokens: num(usage["cache_read_input_tokens"]),
-      cacheCreationTokens: num(usage["cache_creation_input_tokens"]),
-      costUsd: num(msg["total_cost_usd"]),
+  /**
+   * Usage for the whole turn.
+   *
+   * The CLI's `result.usage` is preferred when it carries real numbers, since it
+   * is the CLI's own accounting. When it is absent or empty — older builds, and
+   * error results — the per-call steps are summed instead, which reaches the
+   * same total by a different road. Cost only ever comes from `total_cost_usd`;
+   * it is never derived, because prices are not ours to assume.
+   */
+  #extractUsage(msg: Record<string, unknown>, steps: Step[]): Usage {
+    const raw = isRecord(msg["usage"]) ? msg["usage"] : {};
+    const costUsd = num(msg["total_cost_usd"]);
+    const reported: Usage = {
+      inputTokens: num(raw["input_tokens"]),
+      outputTokens: num(raw["output_tokens"]),
+      cacheReadTokens: num(raw["cache_read_input_tokens"]),
+      cacheCreationTokens: num(raw["cache_creation_input_tokens"]),
+      costUsd,
     };
+
+    const empty =
+      reported.inputTokens === 0 &&
+      reported.outputTokens === 0 &&
+      reported.cacheReadTokens === 0 &&
+      reported.cacheCreationTokens === 0;
+
+    if (empty && steps.length > 0) {
+      const rolled = rollUp(steps, costUsd);
+      return rolled.usage;
+    }
+    return reported;
   }
 
   /**
@@ -420,7 +574,15 @@ export class ClaudeProcess {
     }
 
     this.lastUsedAt = Date.now();
-    this.#turnState = { blocks: new Map(), text: "", thinking: "", openBlock: null };
+    this.#turnState = {
+      blocks: new Map(),
+      text: "",
+      thinking: "",
+      openBlock: null,
+      steps: new Map(),
+      streamingId: null,
+      finalOutput: new Map(),
+    };
     const queue = new EventQueue();
     this.#queue = queue;
 
