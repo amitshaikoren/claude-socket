@@ -105,7 +105,7 @@ describe("Anthropic dialect", () => {
     assert.equal(res.status, 200);
     const body = (await res.json()) as { status: string; service: string };
     assert.equal(body.status, "ok");
-    assert.equal(body.service, "claude-bridge");
+    assert.equal(body.service, "claude-socket");
   });
 });
 
@@ -209,7 +209,7 @@ describe("Anthropic authoritative text trailer", () => {
       .filter((l) => l.startsWith("data: "))
       .map((l) => JSON.parse(l.slice(6)) as Record<string, any>)
       .find((d) => d.type === "message_delta");
-    return frame?.claude_bridge?.text as string | undefined;
+    return frame?.claude_socket?.text as string | undefined;
   }
 
   test("is absent unless asked for", async () => {

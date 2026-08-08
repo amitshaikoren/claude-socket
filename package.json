@@ -1,15 +1,43 @@
 {
-  "name": "claude-bridge",
+  "name": "claude-socket",
   "version": "0.1.0",
-  "private": true,
   "type": "module",
-  "description": "An OpenAI/Anthropic-compatible API server that looks like a locally hosted LLM and is actually the Claude Code CLI.",
+  "description": "Point any OpenAI or Anthropic client at your own Claude Code install, with per-tool-call token accounting.",
+  "keywords": [
+    "claude",
+    "claude-code",
+    "anthropic",
+    "openai",
+    "openai-compatible",
+    "openai-api",
+    "llm",
+    "proxy",
+    "agents",
+    "token-counting",
+    "cli"
+  ],
+  "homepage": "https://github.com/amitshaikoren/claude-socket#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/amitshaikoren/claude-socket.git"
+  },
+  "bugs": {
+    "url": "https://github.com/amitshaikoren/claude-socket/issues"
+  },
   "engines": {
     "node": ">=24.0.0"
   },
+  "files": [
+    "src",
+    "socket.config.example.json",
+    "README.md"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
   "bin": {
-    "claude-bridge": "./src/index.ts",
-    "claude-bridge-cli": "./src/cli.ts"
+    "claude-socket": "./src/index.ts",
+    "claude-socket-cli": "./src/cli.ts"
   },
   "scripts": {
     "start": "node src/index.ts",

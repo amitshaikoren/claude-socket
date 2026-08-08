@@ -4,7 +4,7 @@ import { startTestServer, authHeaders, testConfig, testClass, type TestServer } 
 import { buildSpawnPlan } from "../src/claude/args.ts";
 import { resolveTarget } from "../src/core/resolve.ts";
 import { READ_ONLY_TOOLS } from "../src/core/config.ts";
-import { BridgeError } from "../src/core/types.ts";
+import { SocketError } from "../src/core/types.ts";
 
 /** `--tools` as the CLI would receive it, or null when the flag is absent. */
 function toolsFlag(args: string[]): string | null {
@@ -85,7 +85,7 @@ describe("tool policy resolution", () => {
   test("asking for nothing available is an error, not a silent empty agent", () => {
     assert.throws(
       () => resolve({ "x-claude-tools": "Bash,Write" }, "claude-sonnet-5-semi"),
-      (err: unknown) => err instanceof BridgeError && err.status === 400,
+      (err: unknown) => err instanceof SocketError && err.status === 400,
     );
   });
 

@@ -212,7 +212,7 @@ describe("OpenAI streaming matches non-streaming", () => {
 
 /**
  * The delta stream is an alignment with `done.text`, not a proof of equality.
- * A client that grounds on the reply can ask for the string the bridge itself
+ * A client that grounds on the reply can ask for the string the socket itself
  * treats as authoritative, rather than reassembling one and hoping.
  */
 describe("OpenAI authoritative text trailer", () => {
@@ -235,8 +235,8 @@ describe("OpenAI authoritative text trailer", () => {
     const frame = payloads
       .slice(0, -1)
       .map((p) => JSON.parse(p) as Record<string, any>)
-      .find((c) => c.claude_bridge);
-    return frame?.claude_bridge?.text as string | undefined;
+      .find((c) => c.claude_socket);
+    return frame?.claude_socket?.text as string | undefined;
   };
 
   const body = {
@@ -302,10 +302,10 @@ describe("unparseable tool-call markup is surfaced", () => {
     });
     assert.equal(res.status, 200);
     const body = (await res.json()) as {
-      claude_bridge?: { unparsed_tool_calls?: number };
+      claude_socket?: { unparsed_tool_calls?: number };
       choices: Array<{ message: { tool_calls?: unknown } }>;
     };
-    assert.equal(body.claude_bridge?.unparsed_tool_calls, 1);
+    assert.equal(body.claude_socket?.unparsed_tool_calls, 1);
     assert.equal(body.choices[0]!.message.tool_calls, undefined);
   });
 
@@ -319,10 +319,10 @@ describe("unparseable tool-call markup is surfaced", () => {
     const frames = (await readSse(res))
       .slice(0, -1)
       .map((p) => JSON.parse(p) as Record<string, any>);
-    const trailer = frames.find((f) => f.claude_bridge);
-    assert.equal(trailer?.claude_bridge?.unparsed_tool_calls, 1);
+    const trailer = frames.find((f) => f.claude_socket);
+    assert.equal(trailer?.claude_socket?.unparsed_tool_calls, 1);
     // Opting out of the authoritative text must not opt out of the diagnostic.
-    assert.equal(trailer?.claude_bridge?.text, undefined);
+    assert.equal(trailer?.claude_socket?.text, undefined);
   });
 
   test("a clean turn says nothing", async () => {
@@ -331,8 +331,8 @@ describe("unparseable tool-call markup is surfaced", () => {
       messages: [{ role: "user", content: "nothing odd here" }],
       tools: [TOOL],
     });
-    const body = (await res.json()) as { claude_bridge?: unknown };
-    assert.equal(body.claude_bridge, undefined);
+    const body = (await res.json()) as { claude_socket?: unknown };
+    assert.equal(body.claude_socket, undefined);
   });
 
   test("markup is left alone when the request declared no tools", async () => {
@@ -340,10 +340,10 @@ describe("unparseable tool-call markup is surfaced", () => {
     // report — a conversation about the protocol is not a protocol failure.
     const res = await post({ model: "oracle", messages: [{ role: "user", content: BAD }] });
     const body = (await res.json()) as {
-      claude_bridge?: unknown;
+      claude_socket?: unknown;
       choices: Array<{ message: { content: string } }>;
     };
-    assert.equal(body.claude_bridge, undefined);
+    assert.equal(body.claude_socket, undefined);
     assert.match(body.choices[0]!.message.content, /<tool_call>/);
   });
 });

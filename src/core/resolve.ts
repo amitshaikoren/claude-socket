@@ -2,7 +2,7 @@ import { resolve, join, isAbsolute, relative } from "node:path";
 import type { IncomingHttpHeaders } from "node:http";
 import { resolveModel, type AgentModeConfig, type Config, type ModelEntry } from "./config.ts";
 import {
-  BridgeError,
+  SocketError,
   emptyToolPolicy,
   isAgentic,
   isMode,
@@ -59,7 +59,7 @@ function resolveCwd(mode: AgentModeConfig, requested: string | null): string {
   });
 
   if (!permitted) {
-    throw new BridgeError(
+    throw new SocketError(
       403,
       "permission_error",
       `working directory is outside the permitted roots: ${candidate}`,
@@ -107,7 +107,7 @@ function resolveToolPolicy(
       const ceiling = new Set(tools);
       const narrowed = requested.filter((t) => ceiling.has(t));
       if (narrowed.length === 0) {
-        throw new BridgeError(
+        throw new SocketError(
           400,
           "invalid_request_error",
           `none of the requested tools are available in ${mode} mode ` +

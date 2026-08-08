@@ -4,21 +4,21 @@ import { randomBytes } from "node:crypto";
 import { promisify } from "node:util";
 import { loadConfig, type Config } from "./core/config.ts";
 import { SessionManager } from "./claude/sessions.ts";
-import { createBridgeServer } from "./http/server.ts";
+import { createSocketServer } from "./http/server.ts";
 import { createUsageStore } from "./core/store.ts";
 import { log, setLogLevel, type LogLevel } from "./util/log.ts";
 import { isMode, MODES } from "./core/types.ts";
 
 const execFileAsync = promisify(execFile);
 
-const USAGE = `claude-bridge - an OpenAI/Anthropic-compatible API in front of the Claude Code CLI
+const USAGE = `claude-socket - an OpenAI/Anthropic-compatible API in front of the Claude Code CLI
 
 Usage: node src/index.ts [options]
 
 Options:
   --port <n>          Port to listen on (default 8787)
   --host <addr>       Address to bind (default 127.0.0.1)
-  --config <path>     Config file (default ./bridge.config.json)
+  --config <path>     Config file (default ./socket.config.json)
   --token <value>     API token clients must present (repeatable)
   --no-auth           Disable authentication entirely (loopback only, please)
   --mode <mode>       Default mode for unsuffixed models: oracle | harness | semi
@@ -141,7 +141,7 @@ async function main(): Promise<void> {
 
   if (cfg.auth.required && cfg.auth.tokens.length === 0) {
     // Refusing to start would be unhelpful; starting wide open would be worse.
-    const generated = "sk-bridge-" + randomBytes(24).toString("base64url");
+    const generated = "sk-socket-" + randomBytes(24).toString("base64url");
     cfg.auth.tokens = [generated];
     log.warn("no API token configured; generated one for this run");
   }
@@ -158,7 +158,7 @@ async function main(): Promise<void> {
     retentionDays: cfg.usage.retentionDays,
     memoryMax: cfg.usage.memoryMax,
   });
-  const server = createBridgeServer(cfg, sessions, store);
+  const server = createSocketServer(cfg, sessions, store);
 
   await new Promise<void>((resolve, reject) => {
     server.once("error", reject);
@@ -171,7 +171,7 @@ async function main(): Promise<void> {
 
   const origin = `http://${shown}:${cfg.server.port}`;
   process.stdout.write(
-    `\nclaude-bridge listening on ${base}\n` +
+    `\nclaude-socket listening on ${base}\n` +
       `  API key      ${key}\n` +
       `  dashboard    ${origin}/ui\n` +
       `  default      mode=${cfg.defaults.mode} model=${cfg.defaults.model}\n` +

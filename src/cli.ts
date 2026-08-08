@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * Operator CLI for a running bridge. Talks to the server over HTTP, so it works
+ * Operator CLI for a running socket. Talks to the server over HTTP, so it works
  * against a local or remote instance and never touches the CLI directly.
  */
 import { createInterface } from "node:readline/promises";
@@ -18,7 +18,7 @@ const C = {
   cyan: "\x1b[36m",
 };
 
-const USAGE = `claude-bridge CLI
+const USAGE = `claude-socket CLI
 
 Usage: node src/cli.ts <command> [options]
 
@@ -31,8 +31,8 @@ Commands:
   kill <session-id>   Terminate one session
 
 Options:
-  --url <url>       Base URL          (default http://127.0.0.1:8787, env BRIDGE_URL)
-  --token <token>   API token         (env BRIDGE_TOKEN)
+  --url <url>       Base URL          (default http://127.0.0.1:8787, env SOCKET_URL)
+  --token <token>   API token         (env SOCKET_TOKEN)
   --model <id>      Model for chat    (default oracle)
   --harness         Shorthand for --model harness
   --no-stream       Disable streaming in chat
@@ -48,8 +48,8 @@ interface Options {
 
 function parse(argv: string[]): { command: string; options: Options } {
   const options: Options = {
-    url: process.env["BRIDGE_URL"] ?? "http://127.0.0.1:8787",
-    token: process.env["BRIDGE_TOKEN"] ?? "",
+    url: process.env["SOCKET_URL"] ?? "http://127.0.0.1:8787",
+    token: process.env["SOCKET_TOKEN"] ?? "",
     model: "oracle",
     stream: true,
     rest: [],
@@ -124,7 +124,7 @@ async function cmdStatus(options: Options): Promise<void> {
   const uptimeText = uptime < 3600 ? `${Math.floor(uptime / 60)}m` : `${Math.floor(uptime / 3600)}h`;
 
   stdout.write(
-    `${C.bold}claude-bridge${C.reset} ${C.green}${health.status}${C.reset}  ${C.dim}${options.url}${C.reset}\n\n` +
+    `${C.bold}claude-socket${C.reset} ${C.green}${health.status}${C.reset}  ${C.dim}${options.url}${C.reset}\n\n` +
       `  default      ${stats.config.defaultMode} · ${stats.config.defaultModel}\n` +
       `  sessions     ${stats.sessions.length} live, max ${stats.config.maxSessions}, reuse ${stats.config.reuse ? "on" : "off"}\n` +
       `  uptime       ${uptimeText}\n\n` +

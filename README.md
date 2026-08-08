@@ -1,4 +1,4 @@
-# claude-bridge
+# claude-socket
 
 **An OpenAI/Anthropic-shaped socket in front of your own Claude Code install — one that
 tells you what each tool call in an agent loop actually cost.**
@@ -11,7 +11,7 @@ already have.
 
 And a turn is not a call. It's a model call, a tool call, another model call, a dead end,
 a retry — and what you normally get back is a single usage total once the dust settles,
-which tells you the loop was expensive but not *where*. The bridge measures every billed
+which tells you the loop was expensive but not *where*. The socket measures every billed
 call separately and attributes tokens to the individual tool calls that caused them.
 Charted, filterable, persisted.
 
@@ -36,7 +36,7 @@ That's it. Node 24+, a working `claude` CLI, zero runtime dependencies.
 
 ## What you get
 
-- **Token accounting that survives a tool loop.** A turn is many billed calls; the bridge
+- **Token accounting that survives a tool loop.** A turn is many billed calls; the socket
   measures each one and attributes tokens to individual tool calls. Charted, filterable,
   persisted, and drillable down to the call. → [Token accounting](docs/token-accounting.md)
 - **A read-only agent is a first-class mode.** Not tools-on/tools-off: `semi` lets the
@@ -44,7 +44,7 @@ That's it. Node 24+, a working `claude` CLI, zero runtime dependencies.
   you can let it investigate without letting it act. `oracle` and `harness` sit either
   side. Pick per request; hand it tools of your own in any of them.
 - **It doesn't re-pay for your history.** Stateless clients resend the whole conversation
-  every turn; the bridge keeps a live CLI process per conversation and sends only the new
+  every turn; the socket keeps a live CLI process per conversation and sends only the new
   message — no `session_id` for your client to track. → [Session reuse](docs/developers.md#not-wasting-tokens)
 - **Both dialects, properly.** Streaming, tool calling, `response_format`, images — over
   `/v1/chat/completions` and `/v1/messages`.
@@ -54,12 +54,12 @@ That's it. Node 24+, a working `claude` CLI, zero runtime dependencies.
   → [Grounding on a streamed reply](docs/developers.md#grounding-on-a-streamed-reply)
 
 The constraint moves rather than disappears: you spend plan capacity, so the ceiling is
-your **rate limits**, which the bridge surfaces at `/health` and `/admin/stats`.
+your **rate limits**, which the socket surfaces at `/health` and `/admin/stats`.
 
 ```
   OpenAI SDK ─┐
   Cursor    ──┤   http://host:8787/v1        ┌── claude --print --input-format stream-json
-  Open WebUI ─┼──▶ claude-bridge ────────────┤   (one long-lived process per conversation)
+  Open WebUI ─┼──▶ claude-socket ────────────┤   (one long-lived process per conversation)
   curl      ──┤    (token auth, SSE, usage)  └── your existing Claude Code auth
   LangChain ──┘
 ```
@@ -68,8 +68,8 @@ your **rate limits**, which the bridge surfaces at `/health` and `/admin/stats`.
 <summary><b>curl, and what boot looks like</b></summary>
 
 ```
-claude-bridge listening on http://127.0.0.1:8787/v1
-  API key      sk-bridge-...          # generated if you did not supply one
+claude-socket listening on http://127.0.0.1:8787/v1
+  API key      sk-socket-...          # generated if you did not supply one
   dashboard    http://127.0.0.1:8787/ui
   default      mode=oracle model=claude-sonnet-5
 ```
@@ -112,7 +112,7 @@ curl ... -H "X-Claude-Mode: semi" -H "X-Claude-Tools: Read,Grep"   # narrower st
 `X-Claude-Tools` can only **narrow** what the mode offers, never widen it — otherwise any
 client could promote itself to a full agent by naming `Bash`. Config sets the ceiling.
 
-Separately, you can hand the bridge **your own** tools via the standard OpenAI/Anthropic
+Separately, you can hand the socket **your own** tools via the standard OpenAI/Anthropic
 `tools` field and get calls back to run your side. That works in all three modes, and is
 independent of the above.
 
@@ -127,7 +127,7 @@ to see its individual model calls. That is the GIF above.
 
 ```bash
 node src/cli.ts watch    # same feed, in the terminal
-node src/cli.ts chat     # a REPL against your own bridge
+node src/cli.ts chat     # a REPL against your own socket
 ```
 
 ## Docs

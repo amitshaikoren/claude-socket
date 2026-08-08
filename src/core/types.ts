@@ -1,4 +1,4 @@
-/** Shared types for the bridge. */
+/** Shared types for the socket. */
 
 // Type-only, so the usage <-> types cycle is erased before it reaches Node.
 import type { Step } from "./usage.ts";
@@ -78,8 +78,8 @@ export interface RateLimitInfo {
   isUsingOverage?: boolean;
 }
 
-/** A chat message as accepted by the bridge, after dialect normalization. */
-export interface BridgeMessage {
+/** A chat message as accepted by the socket, after dialect normalization. */
+export interface SocketMessage {
   role: "system" | "user" | "assistant";
   /** Anthropic-shaped content blocks; text-only messages carry one text block. */
   content: ContentBlock[];
@@ -132,9 +132,9 @@ export function toolPolicyKey(policy: ToolPolicy): string {
 }
 
 /** A fully resolved request, independent of which HTTP dialect produced it. */
-export interface BridgeRequest {
+export interface SocketRequest {
   cls: SessionClass;
-  messages: BridgeMessage[];
+  messages: SocketMessage[];
   /** Explicit session pin from X-Claude-Session; bypasses prefix matching. */
   pinnedSession: string | null;
   maxBudgetUsd: number | null;
@@ -142,13 +142,13 @@ export interface BridgeRequest {
   advertisedModel: string;
 }
 
-export class BridgeError extends Error {
+export class SocketError extends Error {
   status: number;
   type: string;
 
   constructor(status: number, type: string, message: string) {
     super(message);
-    this.name = "BridgeError";
+    this.name = "SocketError";
     this.status = status;
     this.type = type;
   }

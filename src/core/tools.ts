@@ -5,7 +5,7 @@ import { log } from "../util/log.ts";
  * Client-side tool calling.
  *
  * The CLI runs its own tools; it has no channel for handing a caller's tools
- * back out. So the bridge teaches the model a tagged protocol in the system
+ * back out. So the socket teaches the model a tagged protocol in the system
  * prompt and parses the tags back out of the reply. The tags are stripped from
  * anything the client sees, which keeps streaming intact — unlike a
  * JSON-schema-constrained response, where the whole turn would have to be

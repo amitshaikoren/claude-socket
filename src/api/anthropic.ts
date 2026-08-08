@@ -18,10 +18,10 @@ import {
   type ParsedCall,
 } from "../core/tools.ts";
 import {
-  BridgeError,
+  SocketError,
   emptyUsage,
   type BlockType,
-  type BridgeMessage,
+  type SocketMessage,
   type ContentBlock,
   type Usage,
 } from "../core/types.ts";
@@ -103,11 +103,11 @@ function systemText(value: unknown): string {
     .join("\n");
 }
 
-function normalize(raw: unknown): BridgeMessage[] {
+function normalize(raw: unknown): SocketMessage[] {
   if (!Array.isArray(raw)) {
-    throw new BridgeError(400, "invalid_request_error", "'messages' must be an array");
+    throw new SocketError(400, "invalid_request_error", "'messages' must be an array");
   }
-  const messages: BridgeMessage[] = [];
+  const messages: SocketMessage[] = [];
   for (const item of raw) {
     if (!isRecord(item)) continue;
     const blocks = contentBlocks(item["content"]);
@@ -115,10 +115,10 @@ function normalize(raw: unknown): BridgeMessage[] {
     messages.push({ role: item["role"] === "assistant" ? "assistant" : "user", content: blocks });
   }
   if (messages.length === 0) {
-    throw new BridgeError(400, "invalid_request_error", "no usable messages in request");
+    throw new SocketError(400, "invalid_request_error", "no usable messages in request");
   }
   if (messages[messages.length - 1]!.role !== "user") {
-    throw new BridgeError(400, "invalid_request_error", "the final message must be from the user");
+    throw new SocketError(400, "invalid_request_error", "the final message must be from the user");
   }
   return messages;
 }
@@ -267,7 +267,7 @@ export async function handleMessages(ctx: Ctx): Promise<void> {
   const first = await iterator.next();
   if (!first.done && first.value.kind === "error") {
     const err = first.value;
-    throw new BridgeError(err.status, err.type, err.message);
+    throw new SocketError(err.status, err.type, err.message);
   }
   const session = !first.done && first.value.kind === "session" ? first.value : null;
   const sessionId = session?.sessionId ?? "";
@@ -282,7 +282,7 @@ export async function handleMessages(ctx: Ctx): Promise<void> {
       const next = await iterator.next();
       if (next.done) break;
       const event = next.value;
-      if (event.kind === "error") throw new BridgeError(event.status, event.type, event.message);
+      if (event.kind === "error") throw new SocketError(event.status, event.type, event.message);
       if (event.kind === "done") {
         text = event.text;
         usage = event.usage;
@@ -334,7 +334,7 @@ export async function handleMessages(ctx: Ctx): Promise<void> {
       stop_reason: calls.length > 0 ? "tool_use" : stopReason,
       stop_sequence: null,
       usage: usagePayload(usage, steps),
-      ...(unparsed > 0 ? { claude_bridge: { unparsed_tool_calls: unparsed } } : {}),
+      ...(unparsed > 0 ? { claude_socket: { unparsed_tool_calls: unparsed } } : {}),
     });
     return;
   }
@@ -435,7 +435,7 @@ export async function handleMessages(ctx: Ctx): Promise<void> {
         // The authoritative text is opt-in because it repeats the whole reply;
         // `unparsed_tool_calls` is not, because it is the only thing that tells
         // a client the difference between the model declining to call a tool and
-        // the bridge having eaten a call it could not parse.
+        // the socket having eaten a call it could not parse.
         const trailer: Record<string, unknown> = {};
         if (wantsAuthoritativeText(ctx.req.headers)) trailer["text"] = replyText;
         if (unparsed > 0) trailer["unparsed_tool_calls"] = unparsed;
@@ -447,7 +447,7 @@ export async function handleMessages(ctx: Ctx): Promise<void> {
               stop_sequence: null,
             },
             usage: usagePayload(usage, steps),
-            ...(Object.keys(trailer).length > 0 ? { claude_bridge: trailer } : {}),
+            ...(Object.keys(trailer).length > 0 ? { claude_socket: trailer } : {}),
           },
           "message_delta",
         );

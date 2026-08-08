@@ -140,7 +140,7 @@ describe("CLI argument construction", () => {
         model: "claude-opus-5",
         systemPrompt: "extra rules",
         effort: "high",
-        cwd: mkdtempSync(join(tmpdir(), "bridge-cwd-")),
+        cwd: mkdtempSync(join(tmpdir(), "socket-cwd-")),
       }),
     );
     const args = plan.args;
@@ -153,7 +153,7 @@ describe("CLI argument construction", () => {
   });
 
   test("a base URL pointing back at this server is stripped from the child", () => {
-    // Without this the spawned CLI would call the bridge, which would spawn
+    // Without this the spawned CLI would call the socket, which would spawn
     // another CLI, without end.
     const previous = process.env["ANTHROPIC_BASE_URL"];
     process.env["ANTHROPIC_BASE_URL"] = `http://127.0.0.1:${cfg.server.port}/v1`;

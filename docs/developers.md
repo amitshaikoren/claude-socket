@@ -43,7 +43,7 @@ tend to send whatever they were configured with and a hard 404 there helps nobod
 The problem: OpenAI-style clients are stateless and resend the **entire conversation** on
 every turn. Piping that into `claude -p` each time re-pays for the whole history.
 
-Instead, the bridge keeps the CLI process **alive** per conversation and talks to it over
+Instead, the socket keeps the CLI process **alive** per conversation and talks to it over
 `--input-format stream-json`. It hash-chains the incoming user messages, so a request that
 extends a conversation it already holds sends only the new tail. History stays in the CLI's
 own context, where prompt caching covers it.
@@ -85,7 +85,7 @@ behaves the way an OpenAI client expects:
 ← "Right now in Oslo it's about 3°C with light rain."
 ```
 
-The CLI has no channel for handing a caller's tools back out, so the bridge teaches the
+The CLI has no channel for handing a caller's tools back out, so the socket teaches the
 model a tagged protocol in the system prompt and parses the tags out of the reply. Tags are
 stripped before anything reaches the client, using an incremental scanner that holds back
 any text that might turn out to be a partial `<tool_call>` — so **streaming still works**,
@@ -105,7 +105,7 @@ An unterminated tag is worse still: everything after it is gone, so the reply re
 complete when it is not.
 
 So the count is reported. Whenever a turn consumed call-shaped markup that yielded no call,
-the response carries `claude_bridge.unparsed_tool_calls` — on the body for a non-streamed
+the response carries `claude_socket.unparsed_tool_calls` — on the body for a non-streamed
 turn, on the terminal frame for a streamed one (`chat.completion.chunk` with no choices for
 OpenAI, `message_delta` for Anthropic). It is unconditional; you do not opt in, and its
 absence means it did not happen. If you are debugging a reply that seems to have ignored
@@ -156,7 +156,7 @@ Streaming responses echo `x-claude-session`, so a client can pin follow-ups expl
 
 ### Grounding on a streamed reply
 
-A streamed reply is reassembled from deltas. The bridge takes care to make that
+A streamed reply is reassembled from deltas. The socket takes care to make that
 reassembly match what the same turn returns non-streamed — block separators are
 restored, partial `<tool_call>` tags are withheld and released at the end — but
 the two can only ever be *aligned*, not proven equal: a CLI record whose text
@@ -171,24 +171,24 @@ the authoritative text instead of reassembling one. Set
 
 ```jsonc
 // OpenAI: a trailer frame with no choices, like the usage frame
-{ "object": "chat.completion.chunk", "choices": [], "claude_bridge": { "text": "…" } }
+{ "object": "chat.completion.chunk", "choices": [], "claude_socket": { "text": "…" } }
 
 // Anthropic: alongside usage on message_delta
-{ "type": "message_delta", "delta": {…}, "usage": {…}, "claude_bridge": { "text": "…" } }
+{ "type": "message_delta", "delta": {…}, "usage": {…}, "claude_socket": { "text": "…" } }
 ```
 
 It is off by default because it repeats the whole reply on the wire.
 
 ## Configuration
 
-Copy `bridge.config.example.json` to `bridge.config.json`, or use flags and env vars —
+Copy `socket.config.example.json` to `socket.config.json`, or use flags and env vars —
 env overrides file, flags override env.
 
 ```
 --port --host --token --no-auth --mode --model --claude-bin --log-level --config
 --usage-db --no-usage-db
-BRIDGE_PORT BRIDGE_HOST BRIDGE_TOKENS BRIDGE_MODE BRIDGE_MODEL BRIDGE_CLAUDE_BIN
-BRIDGE_LOG_LEVEL BRIDGE_NO_AUTH BRIDGE_CONFIG BRIDGE_USAGE_DB BRIDGE_NO_USAGE_DB
+SOCKET_PORT SOCKET_HOST SOCKET_TOKENS SOCKET_MODE SOCKET_MODEL SOCKET_CLAUDE_BIN
+SOCKET_LOG_LEVEL SOCKET_NO_AUTH SOCKET_CONFIG SOCKET_USAGE_DB SOCKET_NO_USAGE_DB
 ```
 
 `--mode` takes `oracle`, `harness`, or `semi`. Note that `node:sqlite` is still marked
@@ -257,11 +257,11 @@ stdin eagerly for exactly this reason.
 curl -s http://127.0.0.1:8787/health
 ```
 
-`{"status":"ok","service":"claude-bridge",...}` means it is up. If the connection is
+`{"status":"ok","service":"claude-socket",...}` means it is up. If the connection is
 refused, start it from the project directory and wait for the banner:
 
 ```bash
-cd D:/projects/claude-bridge && npm start
+cd D:/projects/claude-socket && npm start
 ```
 
 It runs in the foreground, so start it in a background shell if you need to keep working.
@@ -274,7 +274,7 @@ curl -s http://127.0.0.1:8787/admin/bootstrap
 ```
 
 ```json
-{"authRequired":true,"local":true,"tokens":["sk-bridge-..."],"defaultMode":"oracle"}
+{"authRequired":true,"local":true,"tokens":["sk-socket-..."],"defaultMode":"oracle"}
 ```
 
 Use `tokens[0]`. This works because you are on the same machine; it returns an empty list
@@ -354,14 +354,14 @@ which authenticates itself; the **Usage** tab has the charts and the drill-down.
 
 ### Things that will otherwise surprise you
 
-- **Never set `ANTHROPIC_BASE_URL` to this server globally.** The bridge spawns `claude`,
-  which would inherit the variable and call the bridge again, without end. The bridge strips
+- **Never set `ANTHROPIC_BASE_URL` to this server globally.** The socket spawns `claude`,
+  which would inherit the variable and call the socket again, without end. The socket strips
   a self-referencing value from its children as a safety net, but do not rely on it — set
   such variables per-command, not in a shell profile or system environment.
 - **`temperature`, `top_p`, `max_tokens`, `stop`, and `n` are accepted and ignored.** Do not
   tune them and do not report that you did; the CLI exposes no such controls.
 - **Conversations are stateful behind the scenes.** Sending the full message history is
-  correct and cheap — the bridge matches it to a live session and bills only the new turn.
+  correct and cheap — the socket matches it to a live session and bills only the new turn.
   Do not try to "save tokens" by trimming history; that breaks prefix matching and costs
   *more*, because it starts a fresh session.
 - **The `model` you send is echoed back verbatim**, and an unknown name silently falls back
@@ -369,7 +369,7 @@ which authenticates itself; the **Usage** tab has the charts and the drill-down.
   model you named exists — check `/v1/models`.
 - **Tool calling is prompt-driven.** `tools` and `tool_choice` work in both dialects, so
   handle a missing `tool_calls` field. A call that would not parse is dropped, but never
-  silently — check `claude_bridge.unparsed_tool_calls` before concluding the model just
+  silently — check `claude_socket.unparsed_tool_calls` before concluding the model just
   talked.
 - **`usage.tool_call_count` is how many of Claude Code's *own* tools the turn ran**, which
   is not the same question as `tool_calls` in the response. It is counted from the CLI's

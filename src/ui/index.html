@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
-<title>claude-bridge</title>
+<title>claude-socket</title>
 <style>
   :root {
     color-scheme: dark;
@@ -182,7 +182,7 @@
 <body>
 <header>
   <span class="dot" id="dot"></span>
-  <h1>claude<span>-bridge</span></h1>
+  <h1>claude<span>-socket</span></h1>
   <nav class="tabs" role="tablist">
     <button id="tab-live" role="tab" aria-selected="true">Live</button>
     <button id="tab-usage" role="tab" aria-selected="false">Usage</button>
@@ -995,7 +995,7 @@
     $("view-live").classList.toggle("hidden", usage);
     $("tab-usage").setAttribute("aria-selected", String(usage));
     $("tab-live").setAttribute("aria-selected", String(!usage));
-    store.setItem("bridge-tab", name);
+    store.setItem("socket-tab", name);
     if (usage) loadUsage();
   }
 
@@ -1048,7 +1048,7 @@
   function connect() {
     const token = currentToken();
     if (!token && authRequired) return;
-    if (token) store.setItem("bridge-token", token);
+    if (token) store.setItem("socket-token", token);
 
     if (source) source.close();
     if (poller) clearInterval(poller);
@@ -1061,7 +1061,7 @@
 
     refresh();
     poller = setInterval(refresh, 5000);
-    showTab(store.getItem("bridge-tab") || "live");
+    showTab(store.getItem("socket-tab") || "live");
   }
 
   let authRequired = true;
@@ -1092,7 +1092,7 @@
         .join("");
 
       // Prefer the token used last, when it is still one the server accepts.
-      const remembered = store.getItem("bridge-token");
+      const remembered = store.getItem("socket-token");
       if (remembered && info.tokens.includes(remembered)) tokenPick.value = remembered;
 
       tokenPick.classList.remove("hidden");
@@ -1104,7 +1104,7 @@
     }
 
     // Remote, proxied, or disclosure disabled: ask for the key.
-    tokenInput.value = store.getItem("bridge-token") || "";
+    tokenInput.value = store.getItem("socket-token") || "";
     tokenInput.classList.remove("hidden");
     $("connect").classList.remove("hidden");
     $("authnote").textContent = info && !info.local ? "remote — token required" : "token required";

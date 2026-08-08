@@ -1,11 +1,11 @@
 # Token accounting
 
-How claude-bridge measures what a request cost, and why the numbers look the way they do.
+How claude-socket measures what a request cost, and why the numbers look the way they do.
 Back to the [README](../README.md).
 
 A turn is not one model call. An agentic turn *loops* — ask for a tool, read the result,
 ask for another — and **every lap is a separately billed request**. The CLI's final
-`result` reports only the turn aggregate, so the bridge reads the `usage` block on each
+`result` reports only the turn aggregate, so the socket reads the `usage` block on each
 assistant message instead. That is the only place a per-call number exists, and it is what
 makes "what did this message / turn / tool call cost" answerable at all.
 

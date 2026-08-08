@@ -10,7 +10,7 @@ import { telemetry } from "../core/telemetry.ts";
 import { sendJson, type Ctx } from "./context.ts";
 import { handleChatCompletions, handleModels } from "../api/openai.ts";
 import { handleCountTokens, handleMessages } from "../api/anthropic.ts";
-import { BridgeError } from "../core/types.ts";
+import { SocketError } from "../core/types.ts";
 import { parseBucket, type UsageFilter, type UsageStore } from "../core/store.ts";
 import { log } from "../util/log.ts";
 
@@ -33,7 +33,7 @@ async function readBody(req: IncomingMessage): Promise<Record<string, unknown>> 
     const buf = chunk as Buffer;
     size += buf.length;
     if (size > MAX_BODY_BYTES) {
-      throw new BridgeError(413, "invalid_request_error", "request body too large");
+      throw new SocketError(413, "invalid_request_error", "request body too large");
     }
     chunks.push(buf);
   }
@@ -45,7 +45,7 @@ async function readBody(req: IncomingMessage): Promise<Record<string, unknown>> 
     }
     return parsed as Record<string, unknown>;
   } catch (err) {
-    throw new BridgeError(
+    throw new SocketError(
       400,
       "invalid_request_error",
       `invalid JSON body: ${err instanceof Error ? err.message : String(err)}`,
@@ -54,20 +54,20 @@ async function readBody(req: IncomingMessage): Promise<Record<string, unknown>> 
 }
 
 /** Errors are shaped to match whichever API the client thinks it is talking to. */
-function errorBody(anthropicDialect: boolean, err: BridgeError): unknown {
+function errorBody(anthropicDialect: boolean, err: SocketError): unknown {
   if (anthropicDialect) {
     return { type: "error", error: { type: err.type, message: err.message } };
   }
   return { error: { message: err.message, type: err.type, param: null, code: err.status } };
 }
 
-function toBridgeError(err: unknown): BridgeError {
-  if (err instanceof BridgeError) return err;
+function toSocketError(err: unknown): SocketError {
+  if (err instanceof SocketError) return err;
   const message = err instanceof Error ? err.message : String(err);
-  return new BridgeError(500, "internal_error", message);
+  return new SocketError(500, "internal_error", message);
 }
 
-export function createBridgeServer(
+export function createSocketServer(
   cfg: Config,
   sessions: SessionManager,
   store: UsageStore,
@@ -201,7 +201,7 @@ async function handle(
     if (path === "/health") {
       sendJson(res, 200, {
         status: "ok",
-        service: "claude-bridge",
+        service: "claude-socket",
         sessions: sessions.size,
         rate_limit: sessions.rateLimit(),
       });
@@ -239,7 +239,7 @@ async function handle(
         isLocalRequest(req) && cfg.dashboard.localAutoAuth
           ? "; this instance's tokens are available to loopback callers at GET /admin/bootstrap"
           : "";
-      throw new BridgeError(401, "authentication_error", `invalid or missing API key${hint}`);
+      throw new SocketError(401, "authentication_error", `invalid or missing API key${hint}`);
     }
 
     if (req.method === "GET" && path === "/v1/models") {
@@ -279,7 +279,7 @@ async function handle(
 
     if (req.method === "DELETE" && path.startsWith("/admin/sessions/")) {
       const id = decodeURIComponent(path.slice("/admin/sessions/".length));
-      if (!sessions.kill(id)) throw new BridgeError(404, "not_found_error", `no session ${id}`);
+      if (!sessions.kill(id)) throw new SocketError(404, "not_found_error", `no session ${id}`);
       sendJson(res, 200, { killed: id });
       return;
     }
@@ -356,7 +356,7 @@ async function handle(
     }
 
     if (req.method !== "POST") {
-      throw new BridgeError(404, "not_found_error", `no route for ${req.method} ${path}`);
+      throw new SocketError(404, "not_found_error", `no route for ${req.method} ${path}`);
     }
 
     const controller = new AbortController();
@@ -387,19 +387,19 @@ async function handle(
     } else if (path === "/v1/messages/count_tokens") {
       handleCountTokens(ctx);
     } else {
-      throw new BridgeError(404, "not_found_error", `no route for POST ${path}`);
+      throw new SocketError(404, "not_found_error", `no route for POST ${path}`);
     }
     log.info(`${req.method} ${path}`, { ms: Date.now() - started });
   } catch (err) {
-    const bridgeError = toBridgeError(err);
-    if (bridgeError.status >= 500) log.error(`${req.method} ${path} failed`, { error: bridgeError.message });
-    else log.warn(`${req.method} ${path} rejected`, { status: bridgeError.status, error: bridgeError.message });
+    const socketError = toSocketError(err);
+    if (socketError.status >= 500) log.error(`${req.method} ${path} failed`, { error: socketError.message });
+    else log.warn(`${req.method} ${path} rejected`, { status: socketError.status, error: socketError.message });
 
     telemetry.emit("error", {
       path,
-      status: bridgeError.status,
-      errorType: bridgeError.type,
-      message: bridgeError.message,
+      status: socketError.status,
+      errorType: socketError.type,
+      message: socketError.message,
     });
 
     if (res.headersSent) {
@@ -407,6 +407,6 @@ async function handle(
       if (!res.writableEnded) res.end();
       return;
     }
-    sendJson(res, bridgeError.status, errorBody(anthropicDialect, bridgeError));
+    sendJson(res, socketError.status, errorBody(anthropicDialect, socketError));
   }
 }

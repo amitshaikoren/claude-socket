@@ -20,9 +20,9 @@ const BASE_URL_VARS = ["ANTHROPIC_BASE_URL", "ANTHROPIC_API_URL"];
 /**
  * Detect an inherited base URL that points back at this very server.
  *
- * Pointing a Claude client at the bridge is the whole idea, but the CLI the
- * bridge spawns inherits that environment too — so without this the child would
- * call the bridge, which would spawn another child, forever. Only a
+ * Pointing a Claude client at the socket is the whole idea, but the CLI the
+ * socket spawns inherits that environment too — so without this the child would
+ * call the socket, which would spawn another child, forever. Only a
  * self-reference is stripped; a corporate gateway or proxy URL is left alone.
  */
 function selfReferencingVars(port: number): string[] {
@@ -60,7 +60,7 @@ function writePromptFile(dir: string, name: string, contents: string): string {
  * so the agent keeps its loop and loses everything not on it.
  */
 export function buildSpawnPlan(cfg: Config, cls: SessionClass, resumeSessionId?: string): SpawnPlan {
-  const scratchDir = mkdtempSync(join(tmpdir(), "claude-bridge-"));
+  const scratchDir = mkdtempSync(join(tmpdir(), "claude-socket-"));
   const args: string[] = [
     ...cfg.claude.binaryArgs,
     "--print",

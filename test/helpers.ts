@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import type { AddressInfo } from "node:net";
 import { defaultConfig, type Config } from "../src/core/config.ts";
 import { SessionManager } from "../src/claude/sessions.ts";
-import { createBridgeServer } from "../src/http/server.ts";
+import { createSocketServer } from "../src/http/server.ts";
 import { MemoryUsageStore, type UsageStore } from "../src/core/store.ts";
 import { emptyToolPolicy, type SessionClass } from "../src/core/types.ts";
 
@@ -19,7 +19,7 @@ export function testConfig(overrides: Partial<Config> = {}): Config {
   cfg.claude.binaryArgs = [FAKE_CLI];
   cfg.auth.tokens = ["test-token"];
   cfg.logLevel = "error";
-  const workspace = mkdtempSync(join(tmpdir(), "bridge-test-ws-"));
+  const workspace = mkdtempSync(join(tmpdir(), "socket-test-ws-"));
   cfg.harness.workspaceRoot = workspace;
   cfg.semi.workspaceRoot = workspace;
   cfg.sessions.turnTimeoutMs = 15_000;
@@ -54,7 +54,7 @@ export interface TestServer {
 export async function startTestServer(cfg = testConfig()): Promise<TestServer> {
   const sessions = new SessionManager(cfg);
   const store = new MemoryUsageStore();
-  const server = createBridgeServer(cfg, sessions, store);
+  const server = createSocketServer(cfg, sessions, store);
   await new Promise<void>((done) => server.listen(0, "127.0.0.1", done));
   const { port } = server.address() as AddressInfo;
 

@@ -12,7 +12,7 @@ function emit(level: LogLevel, msg: string, extra?: Record<string, unknown>): vo
   const time = new Date().toISOString().slice(11, 23);
   const tail = extra && Object.keys(extra).length > 0 ? " " + JSON.stringify(extra) : "";
   // stdout is reserved for nothing in particular, but keeping logs on stderr
-  // means `claude-bridge > file` stays clean if we ever pipe output.
+  // means `claude-socket > file` stays clean if we ever pipe output.
   process.stderr.write(`${time} ${level.padEnd(5)} ${msg}${tail}\n`);
 }
 

@@ -18,9 +18,9 @@ import {
   type ParsedCall,
 } from "../core/tools.ts";
 import {
-  BridgeError,
+  SocketError,
   emptyUsage,
-  type BridgeMessage,
+  type SocketMessage,
   type ContentBlock,
   type TurnEvent,
   type Usage,
@@ -61,7 +61,7 @@ function contentBlocks(content: unknown): ContentBlock[] {
 }
 
 interface Normalized {
-  messages: BridgeMessage[];
+  messages: SocketMessage[];
   system: string;
 }
 
@@ -70,7 +70,7 @@ function textOfBlocks(blocks: ContentBlock[]): string {
 }
 
 /**
- * Fold an OpenAI message array into the bridge's shape.
+ * Fold an OpenAI message array into the socket's shape.
  *
  * System/developer turns become the session's system prompt. A prior assistant
  * turn that made tool calls is re-rendered in the same tagged form the model
@@ -79,10 +79,10 @@ function textOfBlocks(blocks: ContentBlock[]): string {
  */
 function normalize(raw: unknown): Normalized {
   if (!Array.isArray(raw)) {
-    throw new BridgeError(400, "invalid_request_error", "'messages' must be an array");
+    throw new SocketError(400, "invalid_request_error", "'messages' must be an array");
   }
 
-  const messages: BridgeMessage[] = [];
+  const messages: SocketMessage[] = [];
   const system: string[] = [];
   const callNames = new Map<string, string>();
 
@@ -130,10 +130,10 @@ function normalize(raw: unknown): Normalized {
   }
 
   if (messages.length === 0) {
-    throw new BridgeError(400, "invalid_request_error", "no usable messages in request");
+    throw new SocketError(400, "invalid_request_error", "no usable messages in request");
   }
   if (messages[messages.length - 1]!.role !== "user") {
-    throw new BridgeError(400, "invalid_request_error", "the final message must be from the user");
+    throw new SocketError(400, "invalid_request_error", "the final message must be from the user");
   }
 
   return { messages, system: system.join("\n\n") };
@@ -220,7 +220,7 @@ export async function handleChatCompletions(ctx: Ctx): Promise<void> {
   const streamOptions = isRecord(body["stream_options"]) ? body["stream_options"] : null;
   const includeUsage = streamOptions?.["include_usage"] === true;
   // The delta stream is a best-effort reassembly of `done.text`; a client that
-  // grounds on what the model said wants the string the bridge itself treats as
+  // grounds on what the model said wants the string the socket itself treats as
   // authoritative. Opt-in, since it repeats the whole reply on the wire.
   const includeAuthoritative =
     streamOptions?.["include_authoritative_text"] === true ||
@@ -247,7 +247,7 @@ export async function handleChatCompletions(ctx: Ctx): Promise<void> {
   const first = await iterator.next();
   if (!first.done && first.value.kind === "error") {
     const err = first.value;
-    throw new BridgeError(err.status, err.type, err.message);
+    throw new SocketError(err.status, err.type, err.message);
   }
 
   const session = !first.done && first.value.kind === "session" ? first.value : null;
@@ -265,7 +265,7 @@ export async function handleChatCompletions(ctx: Ctx): Promise<void> {
       const next = await iterator.next();
       if (next.done) break;
       const event = next.value;
-      if (event.kind === "error") throw new BridgeError(event.status, event.type, event.message);
+      if (event.kind === "error") throw new SocketError(event.status, event.type, event.message);
       if (event.kind === "tool_use" && activity !== "off") {
         reasoning += formatToolUse(event.name, event.input);
       } else if (event.kind === "tool_result" && activity !== "off") {
@@ -322,7 +322,7 @@ export async function handleChatCompletions(ctx: Ctx): Promise<void> {
       object: "chat.completion",
       created,
       model: advertised,
-      system_fingerprint: sessionId ? `claude-bridge-${sessionId.slice(0, 12)}` : undefined,
+      system_fingerprint: sessionId ? `claude-socket-${sessionId.slice(0, 12)}` : undefined,
       choices: [
         {
           index: 0,
@@ -332,7 +332,7 @@ export async function handleChatCompletions(ctx: Ctx): Promise<void> {
         },
       ],
       usage: usagePayload(usage, steps),
-      ...(unparsed > 0 ? { claude_bridge: { unparsed_tool_calls: unparsed } } : {}),
+      ...(unparsed > 0 ? { claude_socket: { unparsed_tool_calls: unparsed } } : {}),
     });
     return;
   }
@@ -452,7 +452,7 @@ export async function handleChatCompletions(ctx: Ctx): Promise<void> {
       // authoritative text is opt-in because it repeats the whole reply;
       // `unparsed_tool_calls` is not, because it is the only thing that tells a
       // client the difference between the model declining to call a tool and the
-      // bridge having eaten a call it could not parse.
+      // socket having eaten a call it could not parse.
       if (!failed) {
         const trailer: Record<string, unknown> = {};
         if (includeAuthoritative) trailer["text"] = replyText;
@@ -464,7 +464,7 @@ export async function handleChatCompletions(ctx: Ctx): Promise<void> {
             created,
             model: advertised,
             choices: [],
-            claude_bridge: trailer,
+            claude_socket: trailer,
           });
         }
       }

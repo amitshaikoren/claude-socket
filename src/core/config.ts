@@ -214,7 +214,7 @@ function envList(name: string): string[] | null {
 export function loadConfig(configPath?: string): Config {
   let cfg = defaultConfig();
 
-  const path = configPath ?? process.env.BRIDGE_CONFIG ?? join(projectRoot, "bridge.config.json");
+  const path = configPath ?? process.env.SOCKET_CONFIG ?? join(projectRoot, "socket.config.json");
   if (existsSync(path)) {
     const parsed: unknown = JSON.parse(readFileSync(path, "utf8"));
     if (!isRecord(parsed)) throw new Error(`${path}: expected a JSON object`);
@@ -241,17 +241,17 @@ export function loadConfig(configPath?: string): Config {
   }
 
   // Environment overrides win over the file, so containers can stay stateless.
-  const tokens = envList("BRIDGE_TOKENS") ?? envList("BRIDGE_API_KEYS");
+  const tokens = envList("SOCKET_TOKENS") ?? envList("SOCKET_API_KEYS");
   if (tokens) cfg.auth.tokens = tokens;
-  if (process.env["BRIDGE_HOST"]) cfg.server.host = process.env["BRIDGE_HOST"];
-  if (process.env["BRIDGE_PORT"]) cfg.server.port = Number(process.env["BRIDGE_PORT"]);
-  if (isMode(process.env["BRIDGE_MODE"])) cfg.defaults.mode = process.env["BRIDGE_MODE"];
-  if (process.env["BRIDGE_USAGE_DB"]) cfg.usage.path = process.env["BRIDGE_USAGE_DB"];
-  if (process.env["BRIDGE_NO_USAGE_DB"] === "1") cfg.usage.persist = false;
-  if (process.env["BRIDGE_MODEL"]) cfg.defaults.model = process.env["BRIDGE_MODEL"];
-  if (process.env["BRIDGE_CLAUDE_BIN"]) cfg.claude.binary = process.env["BRIDGE_CLAUDE_BIN"];
-  if (process.env["BRIDGE_LOG_LEVEL"]) cfg.logLevel = process.env["BRIDGE_LOG_LEVEL"] as LogLevel;
-  if (process.env["BRIDGE_NO_AUTH"] === "1") cfg.auth.required = false;
+  if (process.env["SOCKET_HOST"]) cfg.server.host = process.env["SOCKET_HOST"];
+  if (process.env["SOCKET_PORT"]) cfg.server.port = Number(process.env["SOCKET_PORT"]);
+  if (isMode(process.env["SOCKET_MODE"])) cfg.defaults.mode = process.env["SOCKET_MODE"];
+  if (process.env["SOCKET_USAGE_DB"]) cfg.usage.path = process.env["SOCKET_USAGE_DB"];
+  if (process.env["SOCKET_NO_USAGE_DB"] === "1") cfg.usage.persist = false;
+  if (process.env["SOCKET_MODEL"]) cfg.defaults.model = process.env["SOCKET_MODEL"];
+  if (process.env["SOCKET_CLAUDE_BIN"]) cfg.claude.binary = process.env["SOCKET_CLAUDE_BIN"];
+  if (process.env["SOCKET_LOG_LEVEL"]) cfg.logLevel = process.env["SOCKET_LOG_LEVEL"] as LogLevel;
+  if (process.env["SOCKET_NO_AUTH"] === "1") cfg.auth.required = false;
 
   return cfg;
 }

@@ -26,7 +26,7 @@ describe("dashboard and admin API", () => {
     assert.equal(res.status, 200);
     assert.match(res.headers.get("content-type") ?? "", /text\/html/);
     const html = await res.text();
-    assert.match(html, /claude-bridge/);
+    assert.match(html, /claude-socket/);
     assert.match(html, /admin\/events/);
   });
 
