@@ -1,12 +1,17 @@
 # claude-bridge
 
-**Point any OpenAI or Anthropic client at your own Claude Code install.**
+**An OpenAI/Anthropic-shaped socket in front of your own Claude Code install — one that
+tells you what each tool call in an agent loop actually cost.**
 
-Building agentic flows normally means the API: a separate key, metered per token, a bill
-that grows with every tool loop and dead end. But your machine already has an
-authenticated `claude` CLI sitting there. This puts an OpenAI/Anthropic-shaped socket in
-front of it — so your scripts, agents and eval harnesses drive it like any hosted model,
-and you can see exactly what every call cost.
+A turn is not a call. It's a model call, a tool call, another model call, a dead end, a
+retry — and what you normally get back is a single usage total once the dust settles,
+which tells you the loop was expensive but not *where*. The bridge measures every billed
+call separately and attributes tokens to the individual tool calls that caused them.
+Charted, filterable, persisted.
+
+The rest follows from where it sits: your machine already has an authenticated `claude`
+CLI, so scripts, agents and eval harnesses can drive it like any hosted model, on the auth
+you already have.
 
 ![The usage dashboard: token charts, filters, and per-model-call drill-down](docs/dashboard.gif)
 
@@ -29,15 +34,16 @@ That's it. Node 24+, a working `claude` CLI, zero runtime dependencies.
 
 ## What you get
 
-- **Three levels of agent.** `oracle` — plain completions, no tools. `semi` — Claude Code
-  restricted to a tool set you choose (read-only by default). `harness` — Claude Code
-  intact. Pick per request; hand it tools of your own in any of them.
 - **Token accounting that survives a tool loop.** A turn is many billed calls; the bridge
   measures each one and attributes tokens to individual tool calls. Charted, filterable,
-  persisted. → [Token accounting](docs/token-accounting.md)
+  persisted, and drillable down to the call. → [Token accounting](docs/token-accounting.md)
+- **A read-only agent is a first-class mode.** Not tools-on/tools-off: `semi` lets the
+  agent run its own loop over a tool set you choose — read-only unless you widen it — so
+  you can let it investigate without letting it act. `oracle` and `harness` sit either
+  side. Pick per request; hand it tools of your own in any of them.
 - **It doesn't re-pay for your history.** Stateless clients resend the whole conversation
   every turn; the bridge keeps a live CLI process per conversation and sends only the new
-  message. → [Session reuse](docs/developers.md#not-wasting-tokens)
+  message — no `session_id` for your client to track. → [Session reuse](docs/developers.md#not-wasting-tokens)
 - **Both dialects, properly.** Streaming, tool calling, `response_format`, images — over
   `/v1/chat/completions` and `/v1/messages`.
 - **A streamed reply says the same thing as a non-streamed one.** Reassembled deltas match
