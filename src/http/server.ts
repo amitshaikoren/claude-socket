@@ -232,7 +232,14 @@ async function handle(
     }
 
     if (!isAuthorized(cfg, req, url)) {
-      throw new BridgeError(401, "authentication_error", "invalid or missing API key");
+      // A loopback caller can already read the tokens from /admin/bootstrap, so
+      // pointing at it discloses nothing new — it just saves whoever is holding
+      // a stale key from guessing which one this instance generated.
+      const hint =
+        isLocalRequest(req) && cfg.dashboard.localAutoAuth
+          ? "; this instance's tokens are available to loopback callers at GET /admin/bootstrap"
+          : "";
+      throw new BridgeError(401, "authentication_error", `invalid or missing API key${hint}`);
     }
 
     if (req.method === "GET" && path === "/v1/models") {

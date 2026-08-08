@@ -5,7 +5,7 @@ import { SseWriter } from "../http/sse.ts";
 import { activityMode, resolveTarget, wantsAuthoritativeText } from "../core/resolve.ts";
 import { formatToolResult, formatToolUse } from "../core/activity.ts";
 import { recordTurn } from "../core/record.ts";
-import { billed, peakContext, type Step } from "../core/usage.ts";
+import { billed, peakContext, toolCalls, type Step } from "../core/usage.ts";
 import {
   buildToolPrompt,
   extractToolCalls,
@@ -14,6 +14,7 @@ import {
   renderAssistantCalls,
   renderToolResult,
   ReplyStream,
+  warnUnparsed,
   type ParsedCall,
 } from "../core/tools.ts";
 import {
@@ -153,6 +154,9 @@ function finishReason(stopReason: string): string {
  * `billed_tokens` is the headline (input + cache creation + output, excluding
  * replayed cache reads), and `steps` says how many model calls the turn took —
  * which for an agentic turn is the difference between one request and thirty.
+ * `tool_call_count` is the same number `step_usage` implies, as a scalar: a
+ * client auditing what the harness was allowed to do should not have to sum
+ * array lengths to ask whether it did anything.
  */
 function usagePayload(usage: Usage, steps: Step[] = []): Record<string, unknown> {
   const prompt = usage.inputTokens + usage.cacheReadTokens + usage.cacheCreationTokens;
@@ -168,6 +172,7 @@ function usagePayload(usage: Usage, steps: Step[] = []): Record<string, unknown>
     billed_tokens: billed(usage),
     peak_context_tokens: peakContext(steps),
     steps: steps.length,
+    tool_call_count: toolCalls(steps),
     step_usage: steps.map((step) => ({
       index: step.index,
       model: step.model,
@@ -275,11 +280,14 @@ export async function handleChatCompletions(ctx: Ctx): Promise<void> {
     }
 
     let calls: ParsedCall[] = [];
+    let unparsed = 0;
     if (tools.length > 0) {
       const extracted = extractToolCalls(text);
       text = extracted.text;
       calls = extracted.calls;
+      unparsed = extracted.unparsed;
     }
+    if (unparsed > 0) warnUnparsed(unparsed, sessionId);
 
     const message: Record<string, unknown> = { role: "assistant", content: text || null };
     if (reasoning && activity === "reasoning") message["reasoning_content"] = reasoning;
@@ -324,6 +332,7 @@ export async function handleChatCompletions(ctx: Ctx): Promise<void> {
         },
       ],
       usage: usagePayload(usage, steps),
+      ...(unparsed > 0 ? { claude_bridge: { unparsed_tool_calls: unparsed } } : {}),
     });
     return;
   }
@@ -347,6 +356,7 @@ export async function handleChatCompletions(ctx: Ctx): Promise<void> {
   let failed: TurnEvent | null = null;
   let calls: ParsedCall[] = [];
   let replyText = "";
+  let unparsed = 0;
 
   // Reassembles the reply so a streaming client ends up with the same string a
   // non-streaming one gets: half-written <tool_call> tags withheld, trimmed the
@@ -392,6 +402,8 @@ export async function handleChatCompletions(ctx: Ctx): Promise<void> {
             const extracted = extractToolCalls(event.text);
             calls = extracted.calls;
             replyText = extracted.text;
+            unparsed = extracted.unparsed;
+            if (unparsed > 0) warnUnparsed(unparsed, sessionId);
           } else {
             replyText = event.text;
           }
@@ -436,16 +448,25 @@ export async function handleChatCompletions(ctx: Ctx): Promise<void> {
           usage: usagePayload(usage, steps),
         });
       }
-      if (includeAuthoritative && !failed) {
-        // Same trailer shape as the usage frame: no choices, one extra key.
-        sse.send({
-          id,
-          object: "chat.completion.chunk",
-          created,
-          model: advertised,
-          choices: [],
-          claude_bridge: { text: replyText },
-        });
+      // Same trailer shape as the usage frame: no choices, one extra key. The
+      // authoritative text is opt-in because it repeats the whole reply;
+      // `unparsed_tool_calls` is not, because it is the only thing that tells a
+      // client the difference between the model declining to call a tool and the
+      // bridge having eaten a call it could not parse.
+      if (!failed) {
+        const trailer: Record<string, unknown> = {};
+        if (includeAuthoritative) trailer["text"] = replyText;
+        if (unparsed > 0) trailer["unparsed_tool_calls"] = unparsed;
+        if (Object.keys(trailer).length > 0) {
+          sse.send({
+            id,
+            object: "chat.completion.chunk",
+            created,
+            model: advertised,
+            choices: [],
+            claude_bridge: trailer,
+          });
+        }
       }
       sse.send("[DONE]");
       sse.end();

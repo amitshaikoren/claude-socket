@@ -143,6 +143,18 @@ export interface TurnTotals {
   toolCalls: number;
 }
 
+/**
+ * How many of Claude Code's own tools the turn ran. Counted from the CLI's
+ * assistant messages, so it is independent of whether activity is being
+ * forwarded to the client: a zero here means the harness took no action, not
+ * that the reporting is switched off.
+ */
+export function toolCalls(steps: Step[]): number {
+  let total = 0;
+  for (const step of steps) total += step.tools.length;
+  return total;
+}
+
 export function rollUp(steps: Step[], costUsd: number): TurnTotals {
   const usage: Usage = {
     inputTokens: 0,
@@ -151,19 +163,17 @@ export function rollUp(steps: Step[], costUsd: number): TurnTotals {
     cacheCreationTokens: 0,
     costUsd,
   };
-  let toolCalls = 0;
   for (const step of steps) {
     usage.inputTokens += step.usage.inputTokens;
     usage.outputTokens += step.usage.outputTokens;
     usage.cacheReadTokens += step.usage.cacheReadTokens;
     usage.cacheCreationTokens += step.usage.cacheCreationTokens;
-    toolCalls += step.tools.length;
   }
   return {
     usage,
     headline: billed(usage),
     peakContext: peakContext(steps),
     steps: steps.length,
-    toolCalls,
+    toolCalls: toolCalls(steps),
   };
 }

@@ -262,3 +262,127 @@ describe("OpenAI authoritative text trailer", () => {
     assert.match((await trailer(res)) ?? "", /: ground me$/);
   });
 });
+
+/**
+ * Call-shaped markup that does not parse is consumed out of the prose and yields
+ * no call, which from the client's side is indistinguishable from the model
+ * simply answering. These assert the one thing that distinguishes it, at the
+ * layer a client actually sees — the HTTP response, not the scanner.
+ */
+describe("unparseable tool-call markup is surfaced", () => {
+  let server: TestServer;
+
+  before(async () => {
+    server = await startTestServer();
+  });
+  after(async () => {
+    await server.close();
+  });
+
+  const TOOL = {
+    type: "function",
+    function: { name: "noop", description: "does nothing", parameters: { type: "object", properties: {} } },
+  };
+
+  // The fake CLI echoes the prompt, so this comes back inside the reply.
+  const BAD = "<tool_call>{not json}</tool_call>";
+
+  const post = (body: unknown) =>
+    fetch(`${server.base}/v1/chat/completions`, {
+      method: "POST",
+      headers: authHeaders(),
+      body: JSON.stringify(body),
+    });
+
+  test("a non-streamed reply carries the count", async () => {
+    const res = await post({
+      model: "oracle",
+      messages: [{ role: "user", content: BAD }],
+      tools: [TOOL],
+    });
+    assert.equal(res.status, 200);
+    const body = (await res.json()) as {
+      claude_bridge?: { unparsed_tool_calls?: number };
+      choices: Array<{ message: { tool_calls?: unknown } }>;
+    };
+    assert.equal(body.claude_bridge?.unparsed_tool_calls, 1);
+    assert.equal(body.choices[0]!.message.tool_calls, undefined);
+  });
+
+  test("a streamed reply carries it on the terminal frame, unasked", async () => {
+    const res = await post({
+      model: "oracle",
+      messages: [{ role: "user", content: BAD }],
+      tools: [TOOL],
+      stream: true,
+    });
+    const frames = (await readSse(res))
+      .slice(0, -1)
+      .map((p) => JSON.parse(p) as Record<string, any>);
+    const trailer = frames.find((f) => f.claude_bridge);
+    assert.equal(trailer?.claude_bridge?.unparsed_tool_calls, 1);
+    // Opting out of the authoritative text must not opt out of the diagnostic.
+    assert.equal(trailer?.claude_bridge?.text, undefined);
+  });
+
+  test("a clean turn says nothing", async () => {
+    const res = await post({
+      model: "oracle",
+      messages: [{ role: "user", content: "nothing odd here" }],
+      tools: [TOOL],
+    });
+    const body = (await res.json()) as { claude_bridge?: unknown };
+    assert.equal(body.claude_bridge, undefined);
+  });
+
+  test("markup is left alone when the request declared no tools", async () => {
+    // Nothing is scanning, so the text passes through and there is nothing to
+    // report — a conversation about the protocol is not a protocol failure.
+    const res = await post({ model: "oracle", messages: [{ role: "user", content: BAD }] });
+    const body = (await res.json()) as {
+      claude_bridge?: unknown;
+      choices: Array<{ message: { content: string } }>;
+    };
+    assert.equal(body.claude_bridge, undefined);
+    assert.match(body.choices[0]!.message.content, /<tool_call>/);
+  });
+});
+
+describe("the harness's own tool count is on the wire", () => {
+  test("a turn that ran tools reports how many, without opening the database", async () => {
+    const cfg = testConfig();
+    cfg.claude.env = { FAKE_TOOL_USE: "1" };
+    const server = await startTestServer(cfg);
+    try {
+      const res = await fetch(`${server.base}/v1/chat/completions`, {
+        method: "POST",
+        headers: authHeaders(),
+        body: JSON.stringify({ model: "harness", messages: [{ role: "user", content: "read it" }] }),
+      });
+      const body = (await res.json()) as {
+        usage: { tool_call_count: number; step_usage: Array<{ tools: string[] }> };
+      };
+      assert.ok(body.usage.tool_call_count > 0, "the harness ran tools and said so");
+      // The scalar must agree with the per-step breakdown it summarizes.
+      const summed = body.usage.step_usage.reduce((a, s) => a + s.tools.length, 0);
+      assert.equal(body.usage.tool_call_count, summed);
+    } finally {
+      await server.close();
+    }
+  });
+
+  test("a turn that ran none reports zero, not a missing field", async () => {
+    const server = await startTestServer();
+    try {
+      const res = await fetch(`${server.base}/v1/chat/completions`, {
+        method: "POST",
+        headers: authHeaders(),
+        body: JSON.stringify({ model: "oracle", messages: [{ role: "user", content: "hi" }] }),
+      });
+      const body = (await res.json()) as { usage: { tool_call_count: number } };
+      assert.equal(body.usage.tool_call_count, 0);
+    } finally {
+      await server.close();
+    }
+  });
+});

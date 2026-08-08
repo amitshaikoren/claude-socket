@@ -132,7 +132,7 @@ node src/cli.ts chat     # a REPL against your own bridge
 ## Tests
 
 ```bash
-npm test          # 102 tests, no API calls, no cost
+npm test          # 114 tests, no API calls, no cost
 npm run typecheck
 ```
 
