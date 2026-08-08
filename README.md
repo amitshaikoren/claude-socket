@@ -3,15 +3,17 @@
 **An OpenAI/Anthropic-shaped socket in front of your own Claude Code install — one that
 tells you what each tool call in an agent loop actually cost.**
 
-A turn is not a call. It's a model call, a tool call, another model call, a dead end, a
-retry — and what you normally get back is a single usage total once the dust settles,
+Building agentic flows normally means the API: a separate key, metered per token, a bill
+that grows with every tool loop and dead end. But your machine already has an
+authenticated `claude` CLI sitting there. This puts a socket in front of it, so your
+scripts, agents and eval harnesses drive it like any hosted model — on the auth you
+already have.
+
+And a turn is not a call. It's a model call, a tool call, another model call, a dead end,
+a retry — and what you normally get back is a single usage total once the dust settles,
 which tells you the loop was expensive but not *where*. The bridge measures every billed
 call separately and attributes tokens to the individual tool calls that caused them.
 Charted, filterable, persisted.
-
-The rest follows from where it sits: your machine already has an authenticated `claude`
-CLI, so scripts, agents and eval harnesses can drive it like any hosted model, on the auth
-you already have.
 
 ![The usage dashboard: token charts, filters, and per-model-call drill-down](docs/dashboard.gif)
 
