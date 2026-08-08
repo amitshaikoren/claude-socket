@@ -1,6 +1,6 @@
 import { test, describe, before, after } from "node:test";
 import assert from "node:assert/strict";
-import { startTestServer, authHeaders, type TestServer } from "./helpers.ts";
+import { startTestServer, testConfig, authHeaders, type TestServer } from "./helpers.ts";
 
 describe("Anthropic dialect", () => {
   let server: TestServer;
@@ -106,5 +106,118 @@ describe("Anthropic dialect", () => {
     const body = (await res.json()) as { status: string; service: string };
     assert.equal(body.status, "ok");
     assert.equal(body.service, "claude-bridge");
+  });
+});
+
+/**
+ * The mirror of the OpenAI parity suite: the same turn streamed and not
+ * streamed has to yield the same text. Both handlers reassemble independently,
+ * so both need the invariant pinned.
+ */
+describe("Anthropic streaming matches non-streaming", () => {
+  let server: TestServer;
+
+  before(async () => {
+    server = await startTestServer();
+  });
+  after(async () => server.close());
+
+  const NOOP_TOOL = { name: "noop", description: "does nothing", input_schema: { type: "object", properties: {} } };
+
+  const send = (base: string, body: unknown) =>
+    fetch(`${base}/v1/messages`, {
+      method: "POST",
+      headers: authHeaders(),
+      body: JSON.stringify(body),
+    });
+
+  /** Concatenate the text_delta payloads, as a streaming client would. */
+  async function streamedText(res: Response): Promise<string> {
+    assert.equal(res.status, 200);
+    return (await res.text())
+      .split("\n")
+      .filter((l) => l.startsWith("data: "))
+      .map((l) => JSON.parse(l.slice(6)) as Record<string, any>)
+      .filter((d) => d.type === "content_block_delta" && d.delta?.type === "text_delta")
+      .map((d) => d.delta.text as string)
+      .join("");
+  }
+
+  test("keeps a trailing character that could have started a tool_call tag", async () => {
+    const text = await streamedText(
+      await send(server.base, {
+        model: "claude-sonnet-5",
+        max_tokens: 256,
+        messages: [{ role: "user", content: "AB<" }],
+        tools: [NOOP_TOOL],
+        stream: true,
+      }),
+    );
+    assert.match(text, /: AB<$/, "the held tail reached the client");
+  });
+
+  test("restores the blank line between two text blocks", async () => {
+    const cfg = testConfig();
+    cfg.claude.env = { FAKE_TEXT_BLOCKS: "2" };
+    const blocks = await startTestServer(cfg);
+    try {
+      const body = {
+        model: "claude-sonnet-5",
+        max_tokens: 256,
+        messages: [{ role: "user", content: "hi" }],
+      };
+
+      const plain = (await (await send(blocks.base, body)).json()) as {
+        content: Array<{ type: string; text: string }>;
+      };
+      const whole = plain.content[0]!.text;
+      assert.equal(whole, "block one\n\nblock two: hi");
+
+      const streamed = await streamedText(await send(blocks.base, { ...body, stream: true }));
+      assert.equal(streamed, whole, "the delta stream dropped the block separator");
+    } finally {
+      await blocks.close();
+    }
+  });
+});
+
+describe("Anthropic authoritative text trailer", () => {
+  let server: TestServer;
+
+  before(async () => {
+    server = await startTestServer();
+  });
+  after(async () => server.close());
+
+  const body = {
+    model: "claude-sonnet-5",
+    max_tokens: 256,
+    messages: [{ role: "user", content: "ground me" }],
+    stream: true,
+  };
+
+  /** The authoritative string rides on message_delta, beside the usage payload. */
+  async function trailer(headers: Record<string, string>): Promise<string | undefined> {
+    const res = await fetch(`${server.base}/v1/messages`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify(body),
+    });
+    assert.equal(res.status, 200);
+    const frame = (await res.text())
+      .split("\n")
+      .filter((l) => l.startsWith("data: "))
+      .map((l) => JSON.parse(l.slice(6)) as Record<string, any>)
+      .find((d) => d.type === "message_delta");
+    return frame?.claude_bridge?.text as string | undefined;
+  }
+
+  test("is absent unless asked for", async () => {
+    assert.equal(await trailer(authHeaders()), undefined);
+  });
+
+  test("the header opts in", async () => {
+    const text = await trailer({ ...authHeaders(), "x-claude-authoritative-text": "1" });
+    assert.match(text ?? "", /: ground me$/);
   });
 });

@@ -40,6 +40,10 @@ That's it. Node 24+, a working `claude` CLI, zero runtime dependencies.
   message. → [Session reuse](docs/developers.md#not-wasting-tokens)
 - **Both dialects, properly.** Streaming, tool calling, `response_format`, images — over
   `/v1/chat/completions` and `/v1/messages`.
+- **A streamed reply says the same thing as a non-streamed one.** Reassembled deltas match
+  what the same turn returns with `stream: false`, and a client that grounds on the answer
+  rather than displaying it can ask for the authoritative text outright.
+  → [Grounding on a streamed reply](docs/developers.md#grounding-on-a-streamed-reply)
 
 The constraint moves rather than disappears: you spend plan capacity, so the ceiling is
 your **rate limits**, which the bridge surfaces at `/health` and `/admin/stats`.
@@ -128,9 +132,15 @@ node src/cli.ts chat     # a REPL against your own bridge
 ## Tests
 
 ```bash
-npm test          # 89 tests, no API calls, no cost
+npm test          # 114 tests, no API calls, no cost
 npm run typecheck
 ```
 
 Driven by `test/fake-claude.mjs`, a stand-in speaking the same stream-json protocol —
-including the awkward parts the real CLI does, like restating a message under the same id.
+including the awkward parts the real CLI does, like restating a message under the same id
+or splitting a reply across text blocks.
+
+`test/stream-parity.test.ts` pins the one invariant that spans both dialects: the text
+deltas of a turn, reassembled, equal the authoritative reply. It cannot be proved — a CLI
+record whose text never arrived as deltas is unrecoverable from the wire — but it turns a
+future divergence into a failing test rather than a silently different answer.

@@ -98,8 +98,23 @@ system prompt, a conversation with tools is its own session class and never shar
 with one without them.
 
 Caveat worth knowing: this is prompted behaviour, not a constrained decode. Claude follows
-it reliably in testing, but a malformed call is dropped rather than surfaced as a broken
-`tool_call`.
+it reliably in testing, but a call whose JSON does not parse cannot become a `tool_call`.
+Emitting a broken one would be worse, so the region is dropped — and because the tags were
+already stripped out of the prose, the reply comes back looking like an ordinary answer.
+An unterminated tag is worse still: everything after it is gone, so the reply reads as
+complete when it is not.
+
+So the count is reported. Whenever a turn consumed call-shaped markup that yielded no call,
+the response carries `claude_bridge.unparsed_tool_calls` — on the body for a non-streamed
+turn, on the terminal frame for a streamed one (`chat.completion.chunk` with no choices for
+OpenAI, `message_delta` for Anthropic). It is unconditional; you do not opt in, and its
+absence means it did not happen. If you are debugging a reply that seems to have ignored
+your tools or stopped mid-thought, look there first — it is the difference between a
+protocol failure and a hallucination.
+
+Note that none of this applies unless the request declared `tools`. With no tools, nothing
+scans, and text containing `<tool_call>` — a conversation about this protocol, say — passes
+through untouched.
 
 ## Endpoints
 
@@ -135,8 +150,34 @@ Auth accepts `Authorization: Bearer`, `x-api-key`, or `?api_key=`, compared in c
 | `X-Claude-Disallowed-Tools` | Comma-separated tools to remove on top of the configured set. |
 | `X-Claude-Session` | Pin a specific CLI session, bypassing prefix matching. |
 | `X-Claude-Max-Budget-Usd` | Per-turn spend ceiling. |
+| `X-Claude-Authoritative-Text` | Streaming only: add the authoritative reply text to the terminal frame. See below. |
 
 Streaming responses echo `x-claude-session`, so a client can pin follow-ups explicitly.
+
+### Grounding on a streamed reply
+
+A streamed reply is reassembled from deltas. The bridge takes care to make that
+reassembly match what the same turn returns non-streamed — block separators are
+restored, partial `<tool_call>` tags are withheld and released at the end — but
+the two can only ever be *aligned*, not proven equal: a CLI record whose text
+never arrived as deltas is unrecoverable from the wire. `test/stream-parity.test.ts`
+pins the alignment so a future CLI change fails a test instead of silently
+shipping a different string.
+
+If you are grounding or auditing the output rather than displaying it, ask for
+the authoritative text instead of reassembling one. Set
+`X-Claude-Authoritative-Text: 1` (or, for OpenAI clients,
+`stream_options.include_authoritative_text`) and the terminal frame carries it:
+
+```jsonc
+// OpenAI: a trailer frame with no choices, like the usage frame
+{ "object": "chat.completion.chunk", "choices": [], "claude_bridge": { "text": "…" } }
+
+// Anthropic: alongside usage on message_delta
+{ "type": "message_delta", "delta": {…}, "usage": {…}, "claude_bridge": { "text": "…" } }
+```
+
+It is off by default because it repeats the whole reply on the wire.
 
 ## Configuration
 
@@ -326,8 +367,14 @@ which authenticates itself; the **Usage** tab has the charts and the drill-down.
 - **The `model` you send is echoed back verbatim**, and an unknown name silently falls back
   to the default rather than erroring. Do not treat a successful response as proof that the
   model you named exists — check `/v1/models`.
-- **Tool calling is prompt-driven.** `tools` and `tool_choice` work in both dialects, but a
-  malformed call is dropped rather than surfaced, so handle a missing `tool_calls` field.
+- **Tool calling is prompt-driven.** `tools` and `tool_choice` work in both dialects, so
+  handle a missing `tool_calls` field. A call that would not parse is dropped, but never
+  silently — check `claude_bridge.unparsed_tool_calls` before concluding the model just
+  talked.
+- **`usage.tool_call_count` is how many of Claude Code's *own* tools the turn ran**, which
+  is not the same question as `tool_calls` in the response. It is counted from the CLI's
+  output, so it stays accurate with `activity: "off"` — a zero means the harness did
+  nothing, not that reporting is switched off.
 - Errors come back in the shape of whichever dialect you called, so parse
   `error.message` for `/v1/chat/completions` and `error.type` for `/v1/messages`.
 

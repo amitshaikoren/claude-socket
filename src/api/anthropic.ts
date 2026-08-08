@@ -2,10 +2,10 @@ import { randomUUID } from "node:crypto";
 import type { Ctx } from "../http/context.ts";
 import { sendJson } from "../http/context.ts";
 import { SseWriter } from "../http/sse.ts";
-import { activityMode, resolveTarget } from "../core/resolve.ts";
+import { activityMode, resolveTarget, wantsAuthoritativeText } from "../core/resolve.ts";
 import { formatToolResult, formatToolUse } from "../core/activity.ts";
 import { recordTurn } from "../core/record.ts";
-import { billed, peakContext, type Step } from "../core/usage.ts";
+import { billed, peakContext, toolCalls, type Step } from "../core/usage.ts";
 import {
   buildToolPrompt,
   extractToolCalls,
@@ -13,7 +13,8 @@ import {
   parseAnthropicTools,
   renderAssistantCalls,
   renderToolResult,
-  ToolCallScanner,
+  ReplyStream,
+  warnUnparsed,
   type ParsedCall,
 } from "../core/tools.ts";
 import {
@@ -128,6 +129,9 @@ function normalize(raw: unknown): BridgeMessage[] {
  * `billed_tokens` is the headline — input + cache creation + output, leaving out
  * replayed cache reads. `step_usage` breaks a turn down by model call, which for
  * an agent looping through tools is the only place a per-call number exists.
+ * `tool_call_count` is the same number as a scalar: a client auditing what the
+ * harness was allowed to do should not have to sum array lengths to ask whether
+ * it did anything.
  */
 function usagePayload(usage: Usage, steps: Step[] = []): Record<string, unknown> {
   return {
@@ -139,6 +143,7 @@ function usagePayload(usage: Usage, steps: Step[] = []): Record<string, unknown>
     billed_tokens: billed(usage),
     peak_context_tokens: peakContext(steps),
     steps: steps.length,
+    tool_call_count: toolCalls(steps),
     step_usage: steps.map((step) => ({
       index: step.index,
       model: step.model,
@@ -287,11 +292,14 @@ export async function handleMessages(ctx: Ctx): Promise<void> {
     }
 
     let calls: ParsedCall[] = [];
+    let unparsed = 0;
     if (tools.length > 0) {
       const extracted = extractToolCalls(text);
       text = extracted.text;
       calls = extracted.calls;
+      unparsed = extracted.unparsed;
     }
+    if (unparsed > 0) warnUnparsed(unparsed, sessionId);
 
     const content: Array<Record<string, unknown>> = [];
     if (text) content.push({ type: "text", text });
@@ -326,6 +334,7 @@ export async function handleMessages(ctx: Ctx): Promise<void> {
       stop_reason: calls.length > 0 ? "tool_use" : stopReason,
       stop_sequence: null,
       usage: usagePayload(usage, steps),
+      ...(unparsed > 0 ? { claude_bridge: { unparsed_tool_calls: unparsed } } : {}),
     });
     return;
   }
@@ -356,7 +365,11 @@ export async function handleMessages(ctx: Ctx): Promise<void> {
   let failed: { type: string; message: string } | null = null;
   let calls: ParsedCall[] = [];
   let replyText = "";
-  const scanner = tools.length > 0 ? new ToolCallScanner() : null;
+  let unparsed = 0;
+  // Reassembles the reply so a streaming client ends up with the same string a
+  // non-streaming one gets: half-written <tool_call> tags withheld, trimmed the
+  // way extractToolCalls trims, tail released by finish() below.
+  const reply = new ReplyStream(tools.length > 0);
 
   try {
     for (;;) {
@@ -368,8 +381,7 @@ export async function handleMessages(ctx: Ctx): Promise<void> {
       switch (event.kind) {
         case "delta":
           if (event.blockType === "text") {
-            const safe = scanner ? scanner.push(event.text) : event.text;
-            if (safe) writer.delta("text", safe);
+            writer.delta("text", reply.push(event.text));
           } else if (activity === "reasoning") {
             writer.delta("thinking", event.text);
           }
@@ -388,10 +400,16 @@ export async function handleMessages(ctx: Ctx): Promise<void> {
           usage = event.usage;
           steps = event.steps;
           stopReason = event.stopReason;
-          if (scanner) {
+          // The completed text is authoritative for what gets recorded and for
+          // the tool calls; the delta stream can only ever be a best-effort
+          // reassembly of it, since a block whose deltas never arrived is
+          // unrecoverable from the wire.
+          if (tools.length > 0) {
             const extracted = extractToolCalls(event.text);
             calls = extracted.calls;
             replyText = extracted.text;
+            unparsed = extracted.unparsed;
+            if (unparsed > 0) warnUnparsed(unparsed, sessionId);
           } else {
             replyText = event.text;
           }
@@ -406,11 +424,21 @@ export async function handleMessages(ctx: Ctx): Promise<void> {
     }
   } finally {
     if (!sse.closed) {
+      // Release the held tail while the text block is still open; closeBlock()
+      // below would otherwise strand it.
+      if (!failed) writer.delta("text", reply.finish());
       writer.closeBlock();
       if (failed) {
         sse.send({ type: "error", error: { type: failed.type, message: failed.message } }, "error");
       } else {
         for (const call of calls) writer.toolCall(call);
+        // The authoritative text is opt-in because it repeats the whole reply;
+        // `unparsed_tool_calls` is not, because it is the only thing that tells
+        // a client the difference between the model declining to call a tool and
+        // the bridge having eaten a call it could not parse.
+        const trailer: Record<string, unknown> = {};
+        if (wantsAuthoritativeText(ctx.req.headers)) trailer["text"] = replyText;
+        if (unparsed > 0) trailer["unparsed_tool_calls"] = unparsed;
         sse.send(
           {
             type: "message_delta",
@@ -419,6 +447,7 @@ export async function handleMessages(ctx: Ctx): Promise<void> {
               stop_sequence: null,
             },
             usage: usagePayload(usage, steps),
+            ...(Object.keys(trailer).length > 0 ? { claude_bridge: trailer } : {}),
           },
           "message_delta",
         );

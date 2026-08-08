@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { log } from "../util/log.ts";
 
 /**
  * Client-side tool calling.
@@ -137,16 +138,22 @@ export function buildToolPrompt(tools: ToolDef[], choice: ToolChoice): string {
   return lines.join("\n");
 }
 
-function recordCall(body: string, into: ParsedCall[]): void {
+/**
+ * Parse one call region. Returns false when the region held something that could
+ * not become a call — the caller counts those, because the region has already
+ * been consumed out of the prose and dropping it silently is indistinguishable,
+ * from the client's side, from the model simply not calling a tool.
+ */
+function recordCall(body: string, into: ParsedCall[]): boolean {
   const trimmed = body.trim();
-  if (!trimmed) return;
+  if (!trimmed) return false;
   let parsed: unknown;
   try {
     parsed = JSON.parse(trimmed);
   } catch {
-    return; // Malformed call: drop it rather than surface a broken tool_call.
+    return false;
   }
-  if (!isRecord(parsed) || typeof parsed["name"] !== "string") return;
+  if (!isRecord(parsed) || typeof parsed["name"] !== "string") return false;
 
   const args = parsed["arguments"] ?? parsed["input"] ?? {};
   into.push({
@@ -155,6 +162,7 @@ function recordCall(body: string, into: ParsedCall[]): void {
     argumentsJson: typeof args === "string" ? args : JSON.stringify(args),
     arguments: args,
   });
+  return true;
 }
 
 /** Length of the longest suffix of `text` that is a proper prefix of `tag`. */
@@ -175,9 +183,15 @@ export class ToolCallScanner {
   #buffer = "";
   #inCall = false;
   #calls: ParsedCall[] = [];
+  #unparsed = 0;
 
   get calls(): ParsedCall[] {
     return this.#calls;
+  }
+
+  /** Call-shaped regions that yielded no call, and whose text was dropped. */
+  get unparsed(): number {
+    return this.#unparsed;
   }
 
   /** Feed a chunk; returns the text that is safe to forward. */
@@ -189,7 +203,7 @@ export class ToolCallScanner {
       if (this.#inCall) {
         const end = this.#buffer.indexOf(CLOSE);
         if (end < 0) break;
-        recordCall(this.#buffer.slice(0, end), this.#calls);
+        if (!recordCall(this.#buffer.slice(0, end), this.#calls)) this.#unparsed += 1;
         this.#buffer = this.#buffer.slice(end + CLOSE.length);
         this.#inCall = false;
         continue;
@@ -212,26 +226,121 @@ export class ToolCallScanner {
     return out;
   }
 
-  /** Flush the tail. An unterminated call is still parsed if it looks complete. */
-  finish(): { text: string; calls: ParsedCall[] } {
+  /**
+   * Flush the tail. An unterminated call is still parsed if it looks complete;
+   * if it does not, everything after the opening tag is gone, which is the worst
+   * version of this failure — a reply that reads as finished but is not. Hence
+   * the count: it is the only thing that distinguishes it on the wire.
+   */
+  finish(): { text: string; calls: ParsedCall[]; unparsed: number } {
     let text = "";
     if (this.#inCall) {
-      recordCall(this.#buffer, this.#calls);
+      if (!recordCall(this.#buffer, this.#calls)) this.#unparsed += 1;
     } else {
       text = this.#buffer;
     }
     this.#buffer = "";
     this.#inCall = false;
-    return { text, calls: this.#calls };
+    return { text, calls: this.#calls, unparsed: this.#unparsed };
+  }
+}
+
+/**
+ * The streaming counterpart to `extractToolCalls`, for reassembling a reply as
+ * it arrives.
+ *
+ * `ToolCallScanner` holds back a trailing run that could be the start of a tag,
+ * and `extractToolCalls` trims. Neither is resolvable until the stream ends, so
+ * `finish()` must be called — whatever it returns is the tail of the reply, and
+ * dropping it truncates the answer.
+ *
+ * Trimming and tag-stripping apply only when `scanning`, because the callers
+ * likewise only run `extractToolCalls` when the request declared tools.
+ *
+ * Block separators are not handled here: they arrive as ordinary text deltas
+ * synthesized in `claude/process.ts`, next to the accumulator whose join rule
+ * they mirror. Passing them through the scanner is what makes the ordering come
+ * out right — a held `<` releases as `<\n\n` rather than being reordered. The
+ * exception is a tool call left open across a block boundary, where the
+ * separator is absorbed into the call body instead: `state.text` puts it inside
+ * the call region too, so matching the authoritative text and parsing the call
+ * want opposite things there. Unresolvable, pathological, and the authoritative
+ * text is what gets recorded either way.
+ */
+export class ReplyStream {
+  #scanner: ToolCallScanner | null;
+  /** Trailing whitespace, withheld in case it turns out to be the end. */
+  #held = "";
+  /** Whether any non-whitespace has been emitted, i.e. leading trim is done. */
+  #seen = false;
+
+  constructor(scanning: boolean) {
+    this.#scanner = scanning ? new ToolCallScanner() : null;
+  }
+
+  /** Feed a chunk; returns the text that is safe to forward. */
+  push(text: string): string {
+    return this.#shape(this.#scanner ? this.#scanner.push(text) : text);
+  }
+
+  /** Flush the tail. Whatever this returns still belongs to the reply. */
+  finish(): string {
+    const tail = this.#scanner ? this.#scanner.finish().text : "";
+    const out = this.#shape(tail);
+    this.#held = ""; // Trailing whitespace: dropped, matching `.trim()`.
+    return out;
+  }
+
+  /**
+   * Apply the same leading/trailing trim `extractToolCalls` does, without
+   * needing the whole reply: leading whitespace is dropped outright, trailing
+   * whitespace is held until something non-blank follows it.
+   */
+  #shape(safe: string): string {
+    if (!safe) return "";
+    if (!this.#scanner) return safe; // No tools, no trim — the callers don't either.
+
+    let text = this.#held + safe;
+    this.#held = "";
+    if (!this.#seen) {
+      text = text.replace(/^\s+/, "");
+      if (!text) return "";
+      this.#seen = true;
+    }
+    const trailing = /\s+$/.exec(text);
+    if (trailing) {
+      this.#held = trailing[0];
+      text = text.slice(0, text.length - trailing[0].length);
+    }
+    return text;
   }
 }
 
 /** One-shot parse of a complete reply. */
-export function extractToolCalls(text: string): { text: string; calls: ParsedCall[] } {
+export function extractToolCalls(text: string): {
+  text: string;
+  calls: ParsedCall[];
+  unparsed: number;
+} {
   const scanner = new ToolCallScanner();
   const head = scanner.push(text);
   const tail = scanner.finish();
-  return { text: (head + tail.text).trim(), calls: tail.calls };
+  return { text: (head + tail.text).trim(), calls: tail.calls, unparsed: tail.unparsed };
+}
+
+/**
+ * Note a turn where call-shaped markup was consumed without yielding a call.
+ *
+ * The client hears about it on the response; this is for the operator, who is
+ * the one who can do something about it — a model that keeps emitting calls the
+ * parser rejects is a prompt problem, and it is invisible from the CLI's own
+ * output because the CLI never saw the tags as anything but prose.
+ */
+export function warnUnparsed(count: number, sessionId: string): void {
+  log.warn("tool-call markup did not parse; its text was dropped from the reply", {
+    unparsedToolCalls: count,
+    sessionId,
+  });
 }
 
 /** Render a tool result coming back from the client into the model's view. */

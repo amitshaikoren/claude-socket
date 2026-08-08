@@ -34,6 +34,25 @@ describe("dashboard and admin API", () => {
     assert.equal((await fetch(`${server.base}/admin/stats`)).status, 401);
   });
 
+  test("the 401 points a loopback caller at the route that would tell it the token", async () => {
+    // A token this instance generated at startup is not one the caller can
+    // guess. Bootstrap already discloses it to loopback, so naming it here
+    // gives away nothing and saves guessing which key is live.
+    const res = await fetch(`${server.base}/admin/stats`);
+    assert.equal(res.status, 401);
+    const body = (await res.json()) as any;
+    assert.match(body.error.message, /admin\/bootstrap/);
+  });
+
+  test("a proxied 401 keeps the hint to itself", async () => {
+    const res = await fetch(`${server.base}/admin/stats`, {
+      headers: { "x-forwarded-for": "203.0.113.7" },
+    });
+    assert.equal(res.status, 401);
+    const body = (await res.json()) as any;
+    assert.doesNotMatch(body.error.message, /bootstrap/);
+  });
+
   test("bootstrap hands tokens to a local dashboard so it can self-authenticate", async () => {
     const res = await fetch(`${server.base}/admin/bootstrap`);
     assert.equal(res.status, 200);

@@ -2,10 +2,10 @@ import { randomUUID } from "node:crypto";
 import type { Ctx } from "../http/context.ts";
 import { sendJson } from "../http/context.ts";
 import { SseWriter } from "../http/sse.ts";
-import { activityMode, resolveTarget } from "../core/resolve.ts";
+import { activityMode, resolveTarget, wantsAuthoritativeText } from "../core/resolve.ts";
 import { formatToolResult, formatToolUse } from "../core/activity.ts";
 import { recordTurn } from "../core/record.ts";
-import { billed, peakContext, type Step } from "../core/usage.ts";
+import { billed, peakContext, toolCalls, type Step } from "../core/usage.ts";
 import {
   buildToolPrompt,
   extractToolCalls,
@@ -13,7 +13,8 @@ import {
   parseOpenAiTools,
   renderAssistantCalls,
   renderToolResult,
-  ToolCallScanner,
+  ReplyStream,
+  warnUnparsed,
   type ParsedCall,
 } from "../core/tools.ts";
 import {
@@ -153,6 +154,9 @@ function finishReason(stopReason: string): string {
  * `billed_tokens` is the headline (input + cache creation + output, excluding
  * replayed cache reads), and `steps` says how many model calls the turn took —
  * which for an agentic turn is the difference between one request and thirty.
+ * `tool_call_count` is the same number `step_usage` implies, as a scalar: a
+ * client auditing what the harness was allowed to do should not have to sum
+ * array lengths to ask whether it did anything.
  */
 function usagePayload(usage: Usage, steps: Step[] = []): Record<string, unknown> {
   const prompt = usage.inputTokens + usage.cacheReadTokens + usage.cacheCreationTokens;
@@ -168,6 +172,7 @@ function usagePayload(usage: Usage, steps: Step[] = []): Record<string, unknown>
     billed_tokens: billed(usage),
     peak_context_tokens: peakContext(steps),
     steps: steps.length,
+    tool_call_count: toolCalls(steps),
     step_usage: steps.map((step) => ({
       index: step.index,
       model: step.model,
@@ -214,6 +219,12 @@ export async function handleChatCompletions(ctx: Ctx): Promise<void> {
   const stream = body["stream"] === true;
   const streamOptions = isRecord(body["stream_options"]) ? body["stream_options"] : null;
   const includeUsage = streamOptions?.["include_usage"] === true;
+  // The delta stream is a best-effort reassembly of `done.text`; a client that
+  // grounds on what the model said wants the string the bridge itself treats as
+  // authoritative. Opt-in, since it repeats the whole reply on the wire.
+  const includeAuthoritative =
+    streamOptions?.["include_authoritative_text"] === true ||
+    wantsAuthoritativeText(ctx.req.headers);
   const promptPreview = textOfBlocks(messages[messages.length - 1]?.content ?? []);
 
   const activity = activityMode(ctx.cfg, target.cls.mode);
@@ -269,11 +280,14 @@ export async function handleChatCompletions(ctx: Ctx): Promise<void> {
     }
 
     let calls: ParsedCall[] = [];
+    let unparsed = 0;
     if (tools.length > 0) {
       const extracted = extractToolCalls(text);
       text = extracted.text;
       calls = extracted.calls;
+      unparsed = extracted.unparsed;
     }
+    if (unparsed > 0) warnUnparsed(unparsed, sessionId);
 
     const message: Record<string, unknown> = { role: "assistant", content: text || null };
     if (reasoning && activity === "reasoning") message["reasoning_content"] = reasoning;
@@ -318,6 +332,7 @@ export async function handleChatCompletions(ctx: Ctx): Promise<void> {
         },
       ],
       usage: usagePayload(usage, steps),
+      ...(unparsed > 0 ? { claude_bridge: { unparsed_tool_calls: unparsed } } : {}),
     });
     return;
   }
@@ -341,10 +356,12 @@ export async function handleChatCompletions(ctx: Ctx): Promise<void> {
   let failed: TurnEvent | null = null;
   let calls: ParsedCall[] = [];
   let replyText = "";
+  let unparsed = 0;
 
-  // With tools in play, text is filtered so a half-written <tool_call> tag
-  // never reaches the client.
-  const scanner = tools.length > 0 ? new ToolCallScanner() : null;
+  // Reassembles the reply so a streaming client ends up with the same string a
+  // non-streaming one gets: half-written <tool_call> tags withheld, trimmed the
+  // way extractToolCalls trims, tail released by finish() below.
+  const reply = new ReplyStream(tools.length > 0);
 
   const reason = (text: string) => {
     if (activity === "reasoning") chunk({ reasoning_content: text });
@@ -361,7 +378,7 @@ export async function handleChatCompletions(ctx: Ctx): Promise<void> {
       switch (event.kind) {
         case "delta":
           if (event.blockType === "text") {
-            const safe = scanner ? scanner.push(event.text) : event.text;
+            const safe = reply.push(event.text);
             if (safe) chunk({ content: safe });
           } else if (activity === "reasoning") {
             chunk({ reasoning_content: event.text });
@@ -377,12 +394,16 @@ export async function handleChatCompletions(ctx: Ctx): Promise<void> {
           usage = event.usage;
           steps = event.steps;
           stopReason = event.stopReason;
-          // The completed text is authoritative; re-parse it rather than trust
-          // the reassembled delta stream.
-          if (scanner) {
+          // The completed text is authoritative for what gets recorded and for
+          // the tool calls; the delta stream can only ever be a best-effort
+          // reassembly of it, since a block whose deltas never arrived is
+          // unrecoverable from the wire.
+          if (tools.length > 0) {
             const extracted = extractToolCalls(event.text);
             calls = extracted.calls;
             replyText = extracted.text;
+            unparsed = extracted.unparsed;
+            if (unparsed > 0) warnUnparsed(unparsed, sessionId);
           } else {
             replyText = event.text;
           }
@@ -400,6 +421,9 @@ export async function handleChatCompletions(ctx: Ctx): Promise<void> {
       if (failed && failed.kind === "error") {
         sse.send({ error: { message: failed.message, type: failed.type, code: failed.status } });
       } else {
+        // Release what the scanner was holding, before the terminal chunks.
+        const tail = reply.finish();
+        if (tail) chunk({ content: tail });
         calls.forEach((call, index) => {
           chunk({
             tool_calls: [
@@ -423,6 +447,26 @@ export async function handleChatCompletions(ctx: Ctx): Promise<void> {
           choices: [],
           usage: usagePayload(usage, steps),
         });
+      }
+      // Same trailer shape as the usage frame: no choices, one extra key. The
+      // authoritative text is opt-in because it repeats the whole reply;
+      // `unparsed_tool_calls` is not, because it is the only thing that tells a
+      // client the difference between the model declining to call a tool and the
+      // bridge having eaten a call it could not parse.
+      if (!failed) {
+        const trailer: Record<string, unknown> = {};
+        if (includeAuthoritative) trailer["text"] = replyText;
+        if (unparsed > 0) trailer["unparsed_tool_calls"] = unparsed;
+        if (Object.keys(trailer).length > 0) {
+          sse.send({
+            id,
+            object: "chat.completion.chunk",
+            created,
+            model: advertised,
+            choices: [],
+            claude_bridge: trailer,
+          });
+        }
       }
       sse.send("[DONE]");
       sse.end();

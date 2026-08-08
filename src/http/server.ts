@@ -22,7 +22,7 @@ const CORS_HEADERS: Record<string, string> = {
   "access-control-allow-headers":
     "authorization, content-type, x-api-key, anthropic-version, anthropic-beta, " +
     "x-claude-mode, x-claude-effort, x-claude-cwd, x-claude-session, x-claude-max-budget-usd, " +
-    "x-claude-tools, x-claude-disallowed-tools",
+    "x-claude-tools, x-claude-disallowed-tools, x-claude-authoritative-text",
   "access-control-expose-headers": "x-claude-session, x-ratelimit-status, x-ratelimit-reset",
 };
 
@@ -232,7 +232,14 @@ async function handle(
     }
 
     if (!isAuthorized(cfg, req, url)) {
-      throw new BridgeError(401, "authentication_error", "invalid or missing API key");
+      // A loopback caller can already read the tokens from /admin/bootstrap, so
+      // pointing at it discloses nothing new — it just saves whoever is holding
+      // a stale key from guessing which one this instance generated.
+      const hint =
+        isLocalRequest(req) && cfg.dashboard.localAutoAuth
+          ? "; this instance's tokens are available to loopback callers at GET /admin/bootstrap"
+          : "";
+      throw new BridgeError(401, "authentication_error", `invalid or missing API key${hint}`);
     }
 
     if (req.method === "GET" && path === "/v1/models") {

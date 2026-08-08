@@ -82,15 +82,48 @@ describe("tool call extraction", () => {
     assert.equal(calls.length, 0);
   });
 
-  test("malformed JSON is dropped rather than surfaced as a broken call", () => {
-    const { calls } = extractToolCalls("<tool_call>{not json}</tool_call>");
+  test("malformed JSON yields no call, and says so", () => {
+    const { calls, unparsed } = extractToolCalls("<tool_call>{not json}</tool_call>");
     assert.equal(calls.length, 0);
+    // The region is gone from the prose either way. Emitting a broken call is
+    // worse than dropping it, but a client that cannot tell the difference
+    // between this and a plain answer has no way to diagnose the protocol.
+    assert.equal(unparsed, 1);
+  });
+
+  test("valid JSON that is not a call shape also counts as unparsed", () => {
+    const { calls, unparsed } = extractToolCalls('<tool_call>{"nome":"a"}</tool_call>');
+    assert.equal(calls.length, 0);
+    assert.equal(unparsed, 1);
   });
 
   test("an unterminated call is still recovered", () => {
-    const { calls } = extractToolCalls('text <tool_call>{"name":"a","arguments":{}}');
+    const { calls, unparsed } = extractToolCalls('text <tool_call>{"name":"a","arguments":{}}');
     assert.equal(calls.length, 1);
     assert.equal(calls[0]!.name, "a");
+    assert.equal(unparsed, 0);
+  });
+
+  test("an unterminated call that does not parse takes the rest of the reply with it", () => {
+    // The worst version of the failure: the reply reads as complete and is not.
+    const { text, calls, unparsed } = extractToolCalls("The answer is <tool_call>{oops");
+    assert.equal(text, "The answer is");
+    assert.equal(calls.length, 0);
+    assert.equal(unparsed, 1);
+  });
+
+  test("a clean reply reports nothing unparsed", () => {
+    const clean = extractToolCalls('hi <tool_call>{"name":"a","arguments":{}}</tool_call>');
+    assert.equal(clean.unparsed, 0);
+    assert.equal(extractToolCalls("no tags here").unparsed, 0);
+  });
+
+  test("each bad region is counted separately", () => {
+    const { calls, unparsed } = extractToolCalls(
+      '<tool_call>{bad}</tool_call><tool_call>{"name":"ok","arguments":{}}</tool_call><tool_call>{worse}</tool_call>',
+    );
+    assert.deepEqual(calls.map((c) => c.name), ["ok"]);
+    assert.equal(unparsed, 2);
   });
 });
 

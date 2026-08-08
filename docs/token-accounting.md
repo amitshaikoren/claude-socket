@@ -48,6 +48,7 @@ Every response carries the breakdown, as non-standard fields alongside the usual
   "billed_tokens": 1204,          // input + cache creation + output
   "peak_context_tokens": 24118,   // fullest single call
   "steps": 3,                     // model calls in this turn
+  "tool_call_count": 3,           // tools the harness itself ran
   "step_usage": [
     { "index": 1, "output_tokens": 62, "billed_tokens": 812, "tools": ["Read"] },
     { "index": 2, "output_tokens": 34, "billed_tokens": 210, "tools": ["Grep", "Glob"] },
@@ -55,6 +56,15 @@ Every response carries the breakdown, as non-standard fields alongside the usual
   ]
 }
 ```
+
+`tool_call_count` is the sum of the `tools` arrays, hoisted out so that auditing what the
+agent was allowed to do does not require summing them — and so that "it took no action" is
+a value you can assert on rather than an absence you have to infer. It comes from the CLI's
+own output, not from the activity stream, so `activity: "off"` does not zero it: a zero
+means the harness ran nothing.
+
+On a streamed turn the usage frame is opt-in (`stream_options.include_usage` for OpenAI);
+without it, nothing in this block reaches the client.
 
 ### History, and the graphs
 
