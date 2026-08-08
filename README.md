@@ -1,12 +1,17 @@
 # claude-bridge
 
-**Point any OpenAI or Anthropic client at your own Claude Code install.**
+**An OpenAI/Anthropic-shaped socket in front of your own Claude Code install — one that
+tells you what each tool call in an agent loop actually cost.**
 
-Building agentic flows normally means the API: a separate key, metered per token, a bill
-that grows with every tool loop and dead end. But your machine already has an
-authenticated `claude` CLI sitting there. This puts an OpenAI/Anthropic-shaped socket in
-front of it — so your scripts, agents and eval harnesses drive it like any hosted model,
-and you can see exactly what every call cost.
+A turn is not a call. It's a model call, a tool call, another model call, a dead end, a
+retry — and what you normally get back is a single usage total once the dust settles,
+which tells you the loop was expensive but not *where*. The bridge measures every billed
+call separately and attributes tokens to the individual tool calls that caused them.
+Charted, filterable, persisted.
+
+The rest follows from where it sits: your machine already has an authenticated `claude`
+CLI, so scripts, agents and eval harnesses can drive it like any hosted model, on the auth
+you already have.
 
 ![The usage dashboard: token charts, filters, and per-model-call drill-down](docs/dashboard.gif)
 
@@ -29,15 +34,16 @@ That's it. Node 24+, a working `claude` CLI, zero runtime dependencies.
 
 ## What you get
 
-- **Three levels of agent.** `oracle` — plain completions, no tools. `semi` — Claude Code
-  restricted to a tool set you choose (read-only by default). `harness` — Claude Code
-  intact. Pick per request; hand it tools of your own in any of them.
 - **Token accounting that survives a tool loop.** A turn is many billed calls; the bridge
   measures each one and attributes tokens to individual tool calls. Charted, filterable,
-  persisted. → [Token accounting](docs/token-accounting.md)
+  persisted, and drillable down to the call. → [Token accounting](docs/token-accounting.md)
+- **A read-only agent is a first-class mode.** Not tools-on/tools-off: `semi` lets the
+  agent run its own loop over a tool set you choose — read-only unless you widen it — so
+  you can let it investigate without letting it act. `oracle` and `harness` sit either
+  side. Pick per request; hand it tools of your own in any of them.
 - **It doesn't re-pay for your history.** Stateless clients resend the whole conversation
   every turn; the bridge keeps a live CLI process per conversation and sends only the new
-  message. → [Session reuse](docs/developers.md#not-wasting-tokens)
+  message — no `session_id` for your client to track. → [Session reuse](docs/developers.md#not-wasting-tokens)
 - **Both dialects, properly.** Streaming, tool calling, `response_format`, images — over
   `/v1/chat/completions` and `/v1/messages`.
 - **A streamed reply says the same thing as a non-streamed one.** Reassembled deltas match
@@ -109,6 +115,27 @@ Separately, you can hand the bridge **your own** tools via the standard OpenAI/A
 independent of the above.
 
 → [Modes, tool policy and the model catalog](docs/developers.md#models-and-disguising-the-backend)
+
+## If you've seen the other Claude Code wrappers
+
+Several projects put an OpenAI-shaped endpoint in front of the `claude` CLI, and if that
+is all you need, some of them are older and better travelled — [claude-code-openai-wrapper](https://github.com/RichardAtCT/claude-code-openai-wrapper)
+is the most complete, and [CLI2API](https://github.com/zhusq20/CLI2API) has the same
+long-lived-process instinct about not re-paying for history. Where this one goes further,
+as of writing:
+
+| | elsewhere | here |
+| --- | --- | --- |
+| **Cost visibility** | one usage total per request | every billed call in the turn, attributed to the tool call that caused it |
+| **Tool policy** | tools on, or tools off | three tiers; `semi` runs the agent's own loop over a set you choose |
+| **Sessions** | client passes a `session_id` | inferred from the conversation |
+| **Streaming** | often buffer-then-chunk | real deltas, and they provably reassemble to the non-streamed reply |
+
+If none of those matter to you, take the well-travelled option. They matter if you are
+building agent loops and want to know which step is burning the budget.
+
+> Not to be confused with [badlogic/claude-bridge](https://github.com/badlogic/lemmy/tree/main/apps/claude-bridge),
+> which points the other way: it runs Claude Code *against* OpenAI and Gemini models.
 
 ## Watching it work
 
