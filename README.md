@@ -116,27 +116,6 @@ independent of the above.
 
 → [Modes, tool policy and the model catalog](docs/developers.md#models-and-disguising-the-backend)
 
-## If you've seen the other Claude Code wrappers
-
-Several projects put an OpenAI-shaped endpoint in front of the `claude` CLI, and if that
-is all you need, some of them are older and better travelled — [claude-code-openai-wrapper](https://github.com/RichardAtCT/claude-code-openai-wrapper)
-is the most complete, and [CLI2API](https://github.com/zhusq20/CLI2API) has the same
-long-lived-process instinct about not re-paying for history. Where this one goes further,
-as of writing:
-
-| | elsewhere | here |
-| --- | --- | --- |
-| **Cost visibility** | one usage total per request | every billed call in the turn, attributed to the tool call that caused it |
-| **Tool policy** | tools on, or tools off | three tiers; `semi` runs the agent's own loop over a set you choose |
-| **Sessions** | client passes a `session_id` | inferred from the conversation |
-| **Streaming** | often buffer-then-chunk | real deltas, and they provably reassemble to the non-streamed reply |
-
-If none of those matter to you, take the well-travelled option. They matter if you are
-building agent loops and want to know which step is burning the budget.
-
-> Not to be confused with [badlogic/claude-bridge](https://github.com/badlogic/lemmy/tree/main/apps/claude-bridge),
-> which points the other way: it runs Claude Code *against* OpenAI and Gemini models.
-
 ## Watching it work
 
 The dashboard is at `http://127.0.0.1:8787/ui` — opened locally it authenticates itself,
