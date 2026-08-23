@@ -53,6 +53,17 @@ export interface Config {
     systemPrompt: string;
     settingSources: string;
     disableNonEssentialModelCalls: boolean;
+    /**
+     * How the model's own thinking reaches the client. Oracle hands the loop to
+     * the caller, so there is no tool narration here — this governs the thinking
+     * blocks alone.
+     *
+     * `content` merges them into the reply text and is a deliberate opt-in: a
+     * client that grounds or cites what it is given would read the thinking as
+     * assertions rather than as narration. The side channel is the default for
+     * that reason.
+     */
+    activity: "off" | "content" | "reasoning";
   };
   harness: AgentModeConfig;
   /**
@@ -144,6 +155,7 @@ export function defaultConfig(): Config {
       systemPrompt: "You are a helpful assistant.",
       settingSources: "",
       disableNonEssentialModelCalls: true,
+      activity: "reasoning",
     },
     harness: {
       workspaceRoot: join(projectRoot, "workspaces"),

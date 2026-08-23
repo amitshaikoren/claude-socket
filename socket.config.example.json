@@ -15,10 +15,12 @@
 
   "defaults": { "mode": "oracle", "model": "claude-sonnet-5", "effort": null },
 
+  "_oracle_comment": "A bare completion endpoint: the caller owns the tool loop. 'activity' governs the model's thinking, which the CLI emits here whether or not anyone reads it — 'reasoning' puts it on the side channel (reasoning_content, or a thinking block on the Anthropic dialect), 'off' discards it. Set 'content' only if you want the thinking merged into the reply text itself; a client that cites or grounds the reply will read it as assertions.",
   "oracle": {
     "systemPrompt": "You are a helpful assistant.",
     "settingSources": "",
-    "disableNonEssentialModelCalls": true
+    "disableNonEssentialModelCalls": true,
+    "activity": "reasoning"
   },
 
   "_harness_comment": "Claude Code intact. 'tools': null leaves the CLI's own default set in place.",

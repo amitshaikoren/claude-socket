@@ -4,7 +4,6 @@ import { resolveModel, type AgentModeConfig, type Config, type ModelEntry } from
 import {
   SocketError,
   emptyToolPolicy,
-  isAgentic,
   isMode,
   type Mode,
   type SessionClass,
@@ -181,8 +180,20 @@ export function resolveTarget(
   };
 }
 
-/** Whether a mode streams intermediate agent activity to the client. */
+/**
+ * Whether a mode streams intermediate agent activity to the client.
+ *
+ * Every mode has a say. For the agentic pair that means tool narration and the
+ * agent's thinking; oracle runs no loop, so it means the thinking alone, which
+ * this used to drop on the floor before the config was ever consulted.
+ *
+ * Note what this does *not* buy on its own. Claude Code 2.1.220 emits thinking
+ * blocks over stream-json with the text redacted — `thinking: ""` plus a
+ * signature and a token estimate — in every mode, and MAX_THINKING_TOKENS does
+ * not change it. So the side channel is wired end to end but carries nothing
+ * until the CLI exposes the text. That is a CLI-side gap this function cannot
+ * close, and it applies just as much to harness and semi.
+ */
 export function activityMode(cfg: Config, mode: Mode): "off" | "content" | "reasoning" {
-  if (!isAgentic(mode)) return "off";
-  return (modeConfig(cfg, mode) ?? cfg.harness).activity;
+  return (modeConfig(cfg, mode) ?? cfg.oracle).activity;
 }

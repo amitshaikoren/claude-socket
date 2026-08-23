@@ -118,10 +118,20 @@ async function respond(prompt) {
   /** Re-emit the message just sent, verbatim — what the real CLI does. */
   const replay = (content) => send(call, content);
 
-  const openBlock = (index) =>
+  const openBlock = (index, type = "text") =>
     emit({
       type: "stream_event",
-      event: { type: "content_block_start", index, content_block: { type: "text", text: "" } },
+      event: {
+        type: "content_block_start",
+        index,
+        content_block: type === "thinking" ? { type: "thinking", thinking: "" } : { type: "text", text: "" },
+      },
+      parent_tool_use_id: null,
+    });
+  const thinkingDelta = (index, thinking) =>
+    emit({
+      type: "stream_event",
+      event: { type: "content_block_delta", index, delta: { type: "thinking_delta", thinking } },
       parent_tool_use_id: null,
     });
   const blockDelta = (index, text) =>
@@ -160,7 +170,31 @@ async function respond(prompt) {
     return;
   }
 
-  openBlock(0);
+  // The model thinks before it answers. The real CLI emits this in oracle mode
+  // too — stripping the agent does not stop the model from reasoning — so the
+  // fake has to, or nothing downstream of the thinking gate can be tested.
+  //
+  // `redacted` is what the real CLI actually does as of 2.1.220, in every mode:
+  // the thinking block and its deltas arrive, but the text is stripped down to
+  // "" and only a signature survives. A fake that always spoke the thinking
+  // aloud would hide the case the socket really meets in production.
+  const redacted = process.env.FAKE_THINKING === "redacted";
+  const thinking = process.env.FAKE_THINKING === "1" ? `pondering: ${prompt}` : "";
+  const thinks = redacted || thinking !== "";
+  if (thinks) {
+    openBlock(0, "thinking");
+    if (redacted) {
+      thinkingDelta(0, "");
+      thinkingDelta(0, "");
+    } else {
+      for (const piece of thinking.match(/.{1,7}/gs) ?? []) thinkingDelta(0, piece);
+    }
+    stopBlock(0);
+  }
+  // The text block follows the thinking one, so it is no longer index 0.
+  const textIndex = thinks ? 1 : 0;
+
+  openBlock(textIndex);
 
   if (process.env.FAKE_TOOL_USE === "1") {
     // A tool loop: one call asks, the next answers. Two billed calls, which is
@@ -187,16 +221,16 @@ async function respond(prompt) {
   }
 
   for (const piece of reply.match(/.{1,7}/gs) ?? []) {
-    emit({
-      type: "stream_event",
-      event: { type: "content_block_delta", index: 0, delta: { type: "text_delta", text: piece } },
-      parent_tool_use_id: null,
-    });
+    blockDelta(textIndex, piece);
     if (process.env.FAKE_SLOW === "1") await new Promise((r) => setTimeout(r, 25));
   }
 
-  emit({ type: "stream_event", event: { type: "content_block_stop", index: 0 }, parent_tool_use_id: null });
-  assistant([{ type: "text", text: reply }]);
+  stopBlock(textIndex);
+  assistant(
+    thinks
+      ? [{ type: "thinking", thinking }, { type: "text", text: reply }]
+      : [{ type: "text", text: reply }],
+  );
 
   // The turn aggregate, as the CLI reports it: the sum over every billed call.
   const total = steps.reduce(

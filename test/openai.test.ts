@@ -1,6 +1,8 @@
 import { test, describe, before, after } from "node:test";
 import assert from "node:assert/strict";
 import { startTestServer, testConfig, authHeaders, readSse, type TestServer } from "./helpers.ts";
+import { defaultConfig } from "../src/core/config.ts";
+import { activityMode } from "../src/core/resolve.ts";
 
 describe("OpenAI dialect", () => {
   let server: TestServer;
@@ -384,5 +386,216 @@ describe("the harness's own tool count is on the wire", () => {
     } finally {
       await server.close();
     }
+  });
+});
+
+/**
+ * Oracle hands the tool loop to the caller, but the model still thinks — the
+ * CLI emits thinking blocks there exactly as it does under the agent. They used
+ * to be parsed, accumulated and then dropped, because the activity gate
+ * short-circuited to "off" for any non-agentic mode.
+ *
+ * The invariant these tests defend is not "thinking appears" but "thinking
+ * appears *beside* the answer": a client that ignores `reasoning_content` must
+ * not be able to tell the difference.
+ */
+describe("oracle puts the model's thinking on the side channel", () => {
+  const THINKS = { FAKE_THINKING: "1" };
+
+  function thinkingServer(activity: "off" | "content" | "reasoning") {
+    const cfg = testConfig();
+    cfg.claude.env = { ...THINKS };
+    cfg.oracle.activity = activity;
+    return startTestServer(cfg);
+  }
+
+  const send = (server: TestServer, body: unknown) =>
+    fetch(`${server.base}/v1/chat/completions`, {
+      method: "POST",
+      headers: authHeaders(),
+      body: JSON.stringify(body),
+    });
+
+  const body = { model: "oracle", messages: [{ role: "user", content: "hi" }] };
+
+  interface Streamed {
+    content: string;
+    reasoning: string;
+  }
+
+  async function streamOracle(server: TestServer): Promise<Streamed> {
+    const payloads = await readSse(await send(server, { ...body, stream: true }));
+    const deltas = payloads
+      .slice(0, -1)
+      .map((p) => JSON.parse(p) as Record<string, any>)
+      .map((c) => c.choices?.[0]?.delta ?? {});
+    return {
+      content: deltas.filter((d) => d.content).map((d) => d.content as string).join(""),
+      reasoning: deltas
+        .filter((d) => d.reasoning_content)
+        .map((d) => d.reasoning_content as string)
+        .join(""),
+    };
+  }
+
+  test("a streamed reply carries reasoning_content alongside the answer", async () => {
+    const server = await thinkingServer("reasoning");
+    try {
+      const { content, reasoning } = await streamOracle(server);
+      assert.equal(reasoning, "pondering: hi", "the thinking never reached the client");
+      assert.equal(content, "echo1: hi", "the answer changed");
+    } finally {
+      await server.close();
+    }
+  });
+
+  test("the answer is byte-identical to what a client saw before the change", async () => {
+    // `activity: "off"` reproduces the old behaviour exactly, so it stands in
+    // for "before". A client that ignores the side channel must see no
+    // difference at all — that is the whole contract of a side channel.
+    const before = await thinkingServer("off");
+    const after = await thinkingServer("reasoning");
+    try {
+      const old = await streamOracle(before);
+      const now = await streamOracle(after);
+      assert.equal(old.reasoning, "", "the old behaviour leaked reasoning_content");
+      assert.equal(now.content, old.content, "ungating thinking changed the answer");
+    } finally {
+      await before.close();
+      await after.close();
+    }
+  });
+
+  test("the non-streaming path agrees with the streaming one", async () => {
+    // Two servers, so both paths see turn 1 of a fresh fake and the replies are
+    // comparable; the fake numbers its answers per process.
+    const plain = await thinkingServer("reasoning");
+    const streaming = await thinkingServer("reasoning");
+    try {
+      const json = (await (await send(plain, body)).json()) as {
+        choices: Array<{ message: { content: string; reasoning_content?: string } }>;
+      };
+      const message = json.choices[0]!.message;
+      assert.equal(message.reasoning_content, "pondering: hi");
+      assert.equal(message.content, "echo1: hi", "thinking bled into the reply text");
+
+      const streamed = await streamOracle(streaming);
+      assert.equal(streamed.reasoning, message.reasoning_content);
+      assert.equal(streamed.content, message.content);
+    } finally {
+      await plain.close();
+      await streaming.close();
+    }
+  });
+
+  test("'off' still discards it, on both paths", async () => {
+    const server = await thinkingServer("off");
+    try {
+      const { content, reasoning } = await streamOracle(server);
+      assert.equal(reasoning, "");
+      assert.equal(content, "echo1: hi");
+
+      const json = (await (await send(server, body)).json()) as {
+        choices: Array<{ message: { content: string; reasoning_content?: string } }>;
+      };
+      assert.equal(json.choices[0]!.message.reasoning_content, undefined);
+    } finally {
+      await server.close();
+    }
+  });
+
+  test("thinking never lands in content unless an operator asks for it", async () => {
+    // Merging thinking into the reply turns narration into assertions for any
+    // client that cites or grounds what it is given. `content` has to stay an
+    // explicit choice, so what matters here is the shipped default.
+    assert.equal(defaultConfig().oracle.activity, "reasoning", "the default merged thinking");
+
+    const server = await thinkingServer("reasoning");
+    try {
+      const { content } = await streamOracle(server);
+      assert.equal(content, "echo1: hi", "thinking reached the reply text by default");
+      assert.ok(!content.includes("pondering"), "thinking leaked into content");
+    } finally {
+      await server.close();
+    }
+  });
+
+  test("redacted thinking produces no frames at all, on either path", async () => {
+    // What the real CLI does today: the thinking block arrives, its text does
+    // not. A frame carrying no characters is worse than no frame — a client
+    // with a thinking pane would open one and leave it bare — so the streaming
+    // path drops them, which is what the non-streaming path and the Anthropic
+    // writer already did.
+    const cfg = testConfig();
+    cfg.claude.env = { FAKE_THINKING: "redacted" };
+    const streaming = await startTestServer(cfg);
+    const plain = await startTestServer(testConfig({ ...cfg }));
+    try {
+      const streamed = await streamOracle(streaming);
+      assert.equal(streamed.reasoning, "", "an empty thinking delta reached the wire");
+      assert.equal(streamed.content, "echo1: hi", "the answer changed");
+
+      const json = (await (await send(plain, body)).json()) as {
+        choices: Array<{ message: { content: string; reasoning_content?: string } }>;
+      };
+      assert.equal(json.choices[0]!.message.reasoning_content, undefined);
+      assert.equal(json.choices[0]!.message.content, "echo1: hi");
+    } finally {
+      await streaming.close();
+      await plain.close();
+    }
+  });
+
+  test("the 'content' opt-in diverges between the two paths — a pre-existing gap", async () => {
+    // Documenting, not endorsing. The non-streaming path prepends the thinking
+    // to the reply; the streaming path drops it, because its delta case only
+    // knows how to route thinking to `reasoning_content`. This predates oracle
+    // having an activity setting at all — it is equally true of harness and semi
+    // under `activity: "content"` — so closing it would change their behaviour
+    // and belongs in its own change.
+    const plain = await thinkingServer("content");
+    const streaming = await thinkingServer("content");
+    try {
+      const json = (await (await send(plain, body)).json()) as {
+        choices: Array<{ message: { content: string } }>;
+      };
+      assert.equal(json.choices[0]!.message.content, "pondering: hi\necho1: hi");
+
+      const streamed = await streamOracle(streaming);
+      assert.equal(streamed.content, "echo1: hi", "the streaming path started merging");
+      assert.equal(streamed.reasoning, "", "content mode should not use the side channel");
+    } finally {
+      await plain.close();
+      await streaming.close();
+    }
+  });
+});
+
+/**
+ * The gate itself. Oracle gained a say here; the agentic modes must not have
+ * noticed.
+ */
+describe("activityMode", () => {
+  test("oracle answers from its own config instead of short-circuiting to off", () => {
+    const cfg = testConfig();
+    assert.equal(activityMode(cfg, "oracle"), "reasoning");
+
+    cfg.oracle.activity = "off";
+    assert.equal(activityMode(cfg, "oracle"), "off");
+  });
+
+  test("harness and semi are untouched", () => {
+    const cfg = testConfig();
+    assert.equal(activityMode(cfg, "harness"), "reasoning");
+    assert.equal(activityMode(cfg, "semi"), "reasoning");
+
+    // Still their own sections, not oracle's.
+    cfg.oracle.activity = "off";
+    assert.equal(activityMode(cfg, "harness"), "reasoning");
+    assert.equal(activityMode(cfg, "semi"), "reasoning");
+
+    cfg.harness.activity = "content";
+    assert.equal(activityMode(cfg, "harness"), "content");
+    assert.equal(activityMode(cfg, "semi"), "reasoning", "semi followed harness");
   });
 });

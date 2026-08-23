@@ -380,7 +380,12 @@ export async function handleChatCompletions(ctx: Ctx): Promise<void> {
           if (event.blockType === "text") {
             const safe = reply.push(event.text);
             if (safe) chunk({ content: safe });
-          } else if (activity === "reasoning") {
+          } else if (activity === "reasoning" && event.text) {
+            // Empty thinking deltas are dropped, as the text path above drops
+            // empty text and as the Anthropic writer and the non-streaming path
+            // both already do. The CLI emits redacted thinking as a run of
+            // empty deltas, and a frame carrying no characters is worse than no
+            // frame: a client with a thinking pane opens one and leaves it bare.
             chunk({ reasoning_content: event.text });
           }
           break;
