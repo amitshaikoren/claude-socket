@@ -140,13 +140,14 @@ node src/cli.ts chat     # a REPL against your own socket
 ## Tests
 
 ```bash
-npm test          # 114 tests, no API calls, no cost
+npm test          # 123 tests, no API calls, no cost
 npm run typecheck
 ```
 
 Driven by `test/fake-claude.mjs`, a stand-in speaking the same stream-json protocol —
-including the awkward parts the real CLI does, like restating a message under the same id
-or splitting a reply across text blocks.
+including the awkward parts the real CLI does, like restating a message under the same id,
+splitting a reply across text blocks, or sending a thinking block whose text has been
+redacted away to nothing.
 
 `test/stream-parity.test.ts` pins the one invariant that spans both dialects: the text
 deltas of a turn, reassembled, equal the authoritative reply. It cannot be proved — a CLI

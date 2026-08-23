@@ -227,12 +227,17 @@ not acceptable.
 - Tool calling is prompt-driven rather than a constrained decode (see above).
 - Cold conversations with prior history are seeded by rendering the transcript into the
   opening message, since assistant turns cannot be injected into a fresh CLI session.
+- **`reasoning_content` is currently always empty**, in every mode. The socket asks for
+  the model's thinking, parses it and streams it, but Claude Code 2.1.220 redacts the text
+  on the way out — a thinking block arrives carrying a signature and a token estimate and
+  `thinking: ""`. `MAX_THINKING_TOKENS` does not change it. Nothing in the socket can
+  close that gap; it needs the CLI to start emitting the text.
 - `count_tokens` is an approximation.
 
 ## Tests
 
 ```bash
-npm test        # 87 tests, no API calls, no cost
+npm test        # 123 tests, no API calls, no cost
 npm run typecheck
 ```
 
@@ -375,6 +380,11 @@ which authenticates itself; the **Usage** tab has the charts and the drill-down.
   is not the same question as `tool_calls` in the response. It is counted from the CLI's
   output, so it stays accurate with `activity: "off"` — a zero means the harness did
   nothing, not that reporting is switched off.
+- **Do not wait on `reasoning_content` — it arrives empty.** The channel is wired end to
+  end and the setting that governs it (`activity`) is real, but the CLI strips the text out
+  of every thinking block it emits, so there is nothing to put in it. An empty thinking pane
+  is the CLI's doing, not a misconfiguration; do not go hunting for the setting that turns
+  it on, and do not report that you enabled thinking.
 - Errors come back in the shape of whichever dialect you called, so parse
   `error.message` for `/v1/chat/completions` and `error.type` for `/v1/messages`.
 
