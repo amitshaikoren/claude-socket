@@ -1,6 +1,7 @@
 import { mkdirSync } from "node:fs";
 import type { Config } from "../core/config.ts";
 import { ClaudeProcess } from "./process.ts";
+import { ChildRegistry, killTree, killTreeSync, listChildren } from "./reaper.ts";
 import { Mutex } from "../util/mutex.ts";
 import { chain, sha256 } from "../util/hash.ts";
 import { log } from "../util/log.ts";
@@ -111,6 +112,23 @@ function renderTail(messages: SocketMessage[]): ContentBlock[] {
   return [{ type: "text", text }, ...imagesOf(messages)];
 }
 
+const REAP_INTERVAL_MS = 30_000;
+/** How long a disposal is left alone before the orphan sweep counts it as leaked. */
+const DISPOSAL_GRACE_MS = 30_000;
+/** Margin past the turn timeout before a still-locked session is called wedged. */
+const WEDGE_MARGIN_MS = 30_000;
+/**
+ * How old a child must be before the sweep will consider it an orphan.
+ *
+ * The bridge's own short-lived helpers are direct children too — the PowerShell
+ * the enumeration runs in, the `taskkill` that follows it, the `claude
+ * --version` probe at startup — and every one of them is younger than the sweep
+ * that would find it. Anything genuinely leaked was spawned for a request long
+ * before this tick, so nothing real is lost by ignoring the last few seconds,
+ * and a process that leaks inside the window is caught on the next pass.
+ */
+const ORPHAN_MIN_AGE_MS = 10_000;
+
 export class SessionManager {
   #cfg: Config;
   #byChain = new Map<string, Entry>();
@@ -119,11 +137,108 @@ export class SessionManager {
   /** The authoritative set of live sessions, including ones still starting up. */
   #entries = new Set<Entry>();
   #reaper: NodeJS.Timeout;
+  #registry: ChildRegistry;
+  /** pid -> deadline until which a disposal in flight is not yet an orphan. */
+  #disposing = new Map<number, number>();
+  #sweeping = false;
+  #closed = false;
 
   constructor(cfg: Config) {
     this.#cfg = cfg;
-    this.#reaper = setInterval(() => this.#reap(), 30_000);
+    this.#registry = new ChildRegistry(cfg.sessions.registryPath);
+    void this.#sweepPreviousRun();
+    this.#reaper = setInterval(() => this.#reap(), REAP_INTERVAL_MS);
     this.#reaper.unref?.();
+  }
+
+  /** Every pid this pool believes it is responsible for right now. */
+  #trackedPids(): Set<number> {
+    const pids = new Set<number>();
+    for (const entry of this.#entries) {
+      if (entry.proc.pid !== null) pids.add(entry.proc.pid);
+    }
+    const now = Date.now();
+    for (const [pid, deadline] of this.#disposing) {
+      if (deadline > now) pids.add(pid);
+      else this.#disposing.delete(pid);
+    }
+    return pids;
+  }
+
+  /**
+   * Kill what a previous bridge abandoned.
+   *
+   * Sweeping by parent pid cannot reach these: their parent pid names a process
+   * that no longer exists. The registry is the only record that ties them to us,
+   * and it carries a start time precisely so a pid the OS has since recycled
+   * cannot be mistaken for one of ours.
+   */
+  async #sweepPreviousRun(): Promise<void> {
+    const previous = this.#registry.takeOver();
+    if (previous.length === 0) return;
+    const survivors = await ChildRegistry.survivors(previous);
+    if (survivors.length === 0) return;
+    log.warn("killing CLI processes abandoned by a previous run", {
+      count: survivors.length,
+      pids: survivors.map((p) => p.pid),
+    });
+    for (const proc of survivors) await this.#kill(proc.pid, proc.name, "previous run");
+  }
+
+  /**
+   * Reconcile the pool against what the OS actually holds.
+   *
+   * The pool's own bookkeeping is the wrong place to look for a process it has
+   * forgotten — a session dropped, evicted, or lost to a bug is invisible to
+   * every map here by definition. This is the only check that can see one, so
+   * it asks the operating system instead: our own children, minus the pids we
+   * are still accounting for, are orphans.
+   *
+   * Strictly by parent pid. Nothing outside this bridge's own children is ever
+   * a candidate, which is what keeps the user's editor sessions and desktop app
+   * — which have `claude.exe` children of their own — out of range.
+   */
+  async sweepOrphans(minAgeMs = ORPHAN_MIN_AGE_MS): Promise<void> {
+    if (this.#sweeping || this.#closed) return;
+    this.#sweeping = true;
+    try {
+      const cutoff = Date.now() - minAgeMs;
+      const children = await listChildren(process.pid);
+      if (children.length === 0) return;
+      const tracked = this.#trackedPids();
+      // A child whose start time could not be read is left alone: age is half
+      // of what makes this safe, and an unverifiable process is not a target.
+      const orphans = children.filter(
+        (c) => !tracked.has(c.pid) && c.startedMs > 0 && c.startedMs < cutoff,
+      );
+      if (orphans.length === 0) return;
+      // Loud on purpose. A silent sweep would keep the pool looking healthy
+      // while quietly mopping up after whatever is actually leaking.
+      log.warn("orphaned CLI processes found; killing them", {
+        count: orphans.length,
+        tracked: tracked.size,
+        pids: orphans.map((p) => p.pid),
+      });
+      for (const proc of orphans) await this.#kill(proc.pid, proc.name, "orphan sweep");
+    } finally {
+      this.#sweeping = false;
+    }
+  }
+
+  async #kill(pid: number, name: string, reason: string): Promise<void> {
+    try {
+      await killTree(pid);
+      log.warn("killed orphaned CLI process", { pid, name, reason });
+      this.#registry.remove(pid);
+      telemetry.emit("session", { action: "orphan_killed", pid, name, reason });
+    } catch (err) {
+      log.error("could not kill orphaned CLI process", {
+        pid,
+        name,
+        reason,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
   }
 
   get size(): number {
@@ -133,6 +248,7 @@ export class SessionManager {
   stats(): Array<Record<string, unknown>> {
     return [...this.#entries].map((e) => ({
       sessionId: e.proc.sessionId,
+      pid: e.proc.pid,
       mode: e.proc.cls.mode,
       model: e.proc.cls.model,
       turns: e.proc.turns,
@@ -155,15 +271,42 @@ export class SessionManager {
 
   #reap(): void {
     for (const entry of [...this.#entries]) {
+      if (entry.mutex.locked) {
+        // A locked entry is skipped by eviction as well, so nothing else will
+        // ever reclaim it — which makes a lock that is never released a
+        // permanent leak of both the slot and the process behind it. No honest
+        // turn can outlive its own timeout, so one that has is not busy, it is
+        // wedged, and it gets dropped like anything else.
+        if (entry.proc.idleMs > this.#cfg.sessions.turnTimeoutMs + WEDGE_MARGIN_MS) {
+          log.warn("session held its lock past the turn timeout; dropping it", {
+            sessionId: entry.proc.sessionId?.slice(0, 8),
+            idleSeconds: Math.round(entry.proc.idleMs / 1000),
+          });
+          this.#drop(entry, "wedged");
+        }
+        continue;
+      }
       const stale = !entry.proc.alive || entry.proc.idleMs > this.#cfg.sessions.idleMs;
-      if (stale && !entry.mutex.locked) this.#drop(entry, "idle");
+      if (stale) this.#drop(entry, "idle");
     }
+    // A burst can push the pool past `max`, because eviction gives up when every
+    // session is mid-turn. Nothing used to bring it back down again except more
+    // traffic, so a burst that ended quietly left its overshoot standing — 112
+    // processes against a cap of 16, until the idle timeout got to them a
+    // quarter of an hour later. The cap is checked here too, once they are idle.
+    this.#trim(this.#cfg.sessions.max, "over capacity");
+    void this.sweepOrphans();
   }
 
   #drop(entry: Entry, reason: string): void {
     this.#entries.delete(entry);
     this.#byChain.delete(entry.chainKey);
     if (entry.proc.sessionId) this.#bySessionId.delete(entry.proc.sessionId);
+    // Held back from the orphan sweep only for as long as an honest disposal
+    // takes; past that the sweep is welcome to it, because a disposal that has
+    // not landed by then is itself the leak.
+    const pid = entry.proc.pid;
+    if (pid !== null) this.#disposing.set(pid, Date.now() + DISPOSAL_GRACE_MS);
     entry.proc.dispose();
     log.debug("session dropped", { reason, sessionId: entry.proc.sessionId?.slice(0, 8) });
     telemetry.emit("session", {
@@ -185,15 +328,21 @@ export class SessionManager {
     return true;
   }
 
-  #evictIfNeeded(): void {
-    while (this.#entries.size >= this.#cfg.sessions.max) {
+  /** Drop least-recently-used idle sessions until at most `limit` remain. */
+  #trim(limit: number, reason: string): void {
+    while (this.#entries.size > limit) {
       const idle = [...this.#entries]
         .filter((e) => !e.mutex.locked)
         .sort((a, b) => a.proc.lastUsedAt - b.proc.lastUsedAt);
       const victim = idle[0];
       if (!victim) return; // everything is busy; let the new session push us over
-      this.#drop(victim, "evicted");
+      this.#drop(victim, reason);
     }
+  }
+
+  #evictIfNeeded(): void {
+    // One below the cap, so the session about to be created fits inside it.
+    this.#trim(this.#cfg.sessions.max - 1, "evicted");
   }
 
   /** Find the longest already-consumed prefix of this conversation. */
@@ -233,6 +382,17 @@ export class SessionManager {
     const proc = new ClaudeProcess(this.#cfg, req.cls);
     const entry: Entry = { proc, mutex: new Mutex(), chainKey: classKey(req.cls) };
     this.#entries.add(entry);
+
+    const pid = proc.pid;
+    if (pid !== null) {
+      // On disk before the process can matter, so a bridge that dies without
+      // running its shutdown path still leaves the next one enough to find it.
+      this.#registry.add(pid, proc.spawnedAt);
+      void proc.whenGone.then(() => {
+        this.#registry.remove(pid);
+        this.#disposing.delete(pid);
+      });
+    }
     return entry;
   }
 
@@ -363,7 +523,18 @@ export class SessionManager {
   }
 
   shutdown(): void {
+    this.#closed = true;
     clearInterval(this.#reaper);
+    const pids = [...this.#entries]
+      .map((e) => e.proc.pid)
+      .filter((p): p is number => p !== null);
     for (const entry of [...this.#entries]) this.#drop(entry, "shutdown");
+    // Every timer disposal relies on is unref'd, so the bridge may well be gone
+    // before any of them fires — which is how a restart inside the kill window
+    // used to strand a process for good. This is the one stop that does not
+    // depend on the event loop still being here to run it. It costs the CLI its
+    // graceful flush; a leaked process costs a gigabyte.
+    killTreeSync(pids);
+    this.#registry.clear();
   }
 }

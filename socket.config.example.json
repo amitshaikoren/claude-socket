@@ -54,11 +54,13 @@
     "allowRequestTools": true
   },
 
+  "_sessions_comment": "registryPath is where the pids of spawned CLI processes are written. A bridge that dies without shutting down cleanly leaves its children behind, and their parent pid names nothing by then — this file is what lets the next run find and kill them.",
   "sessions": {
     "max": 16,
     "idleMs": 900000,
     "reuse": true,
-    "turnTimeoutMs": 1200000
+    "turnTimeoutMs": 1200000,
+    "registryPath": "./data/children.json"
   },
 
   "_usage_comment": "Token history, one row per turn plus one per model call and tool call inside it. Persisted with node:sqlite so it survives a restart; set persist false to keep it in a memory ring buffer instead. retentionDays 0 keeps everything.",

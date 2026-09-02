@@ -23,6 +23,10 @@ export function testConfig(overrides: Partial<Config> = {}): Config {
   cfg.harness.workspaceRoot = workspace;
   cfg.semi.workspaceRoot = workspace;
   cfg.sessions.turnTimeoutMs = 15_000;
+  // Per-run, and never in the repo: the registry drives a startup sweep that
+  // kills what it finds, so two test files sharing one file would kill each
+  // other's fake CLIs.
+  cfg.sessions.registryPath = join(mkdtempSync(join(tmpdir(), "socket-test-pids-")), "children.json");
   // Tests must not write a database into the repo, and none of them restart a
   // server, so there is nothing for persistence to prove here.
   cfg.usage.persist = false;
