@@ -75,7 +75,18 @@ export interface Config {
     /** Whether a request may widen its own tool set beyond this default. */
     allowRequestTools: boolean;
   };
-  sessions: { max: number; idleMs: number; reuse: boolean; turnTimeoutMs: number };
+  sessions: {
+    max: number;
+    idleMs: number;
+    reuse: boolean;
+    turnTimeoutMs: number;
+    /**
+     * Where the pids of spawned CLI processes are written, so a restarted
+     * bridge can kill what the previous one abandoned. Their parent pid is dead
+     * by then, so this file is the only thing tying them back to us.
+     */
+    registryPath: string;
+  };
   usage: {
     /** Persist turn history to SQLite. Off keeps it in a memory ring buffer. */
     persist: boolean;
@@ -185,7 +196,13 @@ export function defaultConfig(): Config {
       disableNonEssentialModelCalls: true,
       allowRequestTools: true,
     },
-    sessions: { max: 16, idleMs: 15 * 60_000, reuse: true, turnTimeoutMs: 20 * 60_000 },
+    sessions: {
+      max: 16,
+      idleMs: 15 * 60_000,
+      reuse: true,
+      turnTimeoutMs: 20 * 60_000,
+      registryPath: join(projectRoot, "data", "children.json"),
+    },
     usage: {
       persist: true,
       path: join(projectRoot, "data", "usage.db"),

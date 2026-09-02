@@ -244,9 +244,17 @@ export async function handleChatCompletions(ctx: Ctx): Promise<void> {
   const created = Math.floor(Date.now() / 1000);
 
   const iterator = events[Symbol.asyncIterator]();
+  // An async generator abandoned mid-iteration never runs its `finally`, and
+  // the one in SessionManager.run is what releases the session's lock. A lock
+  // that is never released pins its entry busy forever, and a busy entry is
+  // skipped by both the reaper and eviction — so the CLI behind it lives until
+  // the bridge dies. Every exit from here, thrown or broken out of, has to end
+  // the iterator. See `release()` below and the `finally` in the stream path.
+  const release = () => void iterator.return?.(undefined);
   const first = await iterator.next();
   if (!first.done && first.value.kind === "error") {
     const err = first.value;
+    release();
     throw new SocketError(err.status, err.type, err.message);
   }
 
@@ -265,7 +273,10 @@ export async function handleChatCompletions(ctx: Ctx): Promise<void> {
       const next = await iterator.next();
       if (next.done) break;
       const event = next.value;
-      if (event.kind === "error") throw new SocketError(event.status, event.type, event.message);
+      if (event.kind === "error") {
+        release();
+        throw new SocketError(event.status, event.type, event.message);
+      }
       if (event.kind === "tool_use" && activity !== "off") {
         reasoning += formatToolUse(event.name, event.input);
       } else if (event.kind === "tool_result" && activity !== "off") {
@@ -422,6 +433,10 @@ export async function handleChatCompletions(ctx: Ctx): Promise<void> {
       if (failed) break;
     }
   } finally {
+    // Covers every way out of the loop above, including the two that leave the
+    // generator suspended: a client that hung up mid-stream, and a turn that
+    // ended in an error event.
+    release();
     if (!sse.closed) {
       if (failed && failed.kind === "error") {
         sse.send({ error: { message: failed.message, type: failed.type, code: failed.status } });

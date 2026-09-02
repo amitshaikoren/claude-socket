@@ -9,6 +9,7 @@
  * respawned.
  */
 import { randomUUID } from "node:crypto";
+import { spawn } from "node:child_process";
 import { writeFileSync } from "node:fs";
 
 const argv = process.argv.slice(2);
@@ -23,6 +24,14 @@ if (argv.includes("--version")) {
 
 const sessionId = process.env.FAKE_SESSION_ID || randomUUID();
 let turn = 0;
+
+// A helper process of the CLI's own — the real one has them, and the socket's
+// grandchildren are deliberately outside the orphan sweep's reach: it targets
+// direct children only, and lets `taskkill /T` take the subtree with the parent.
+if (process.env.FAKE_SPAWN_CHILD) {
+  const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1e9)"], { stdio: "ignore" });
+  writeFileSync(process.env.FAKE_SPAWN_CHILD, String(child.pid), "utf8");
+}
 
 function emit(obj) {
   process.stdout.write(JSON.stringify({ ...obj, session_id: sessionId }) + "\n");
@@ -75,6 +84,25 @@ function finalOutput(call) {
 
 async function respond(prompt) {
   turn += 1;
+
+  // An upstream failure that leaves the CLI running, which is what a session
+  // limit actually looks like: the turn ends in an error result and the process
+  // stays up waiting for the next message. This is the shape that leaked — the
+  // API layer throws on the error event and abandons the turn generator.
+  if (process.env.FAKE_ERROR) {
+    emit({
+      type: "result",
+      subtype: "error_during_execution",
+      is_error: true,
+      api_error_status: Number(process.env.FAKE_ERROR),
+      num_turns: turn,
+      total_cost_usd: 0,
+      usage: {},
+      result: "upstream rejected the request",
+    });
+    return;
+  }
+
   const reply = `echo${turn}: ${prompt}`;
   const messageId = `msg_${randomUUID().replace(/-/g, "")}`;
   let call = 0;
@@ -294,5 +322,14 @@ process.stdin.on("data", (chunk) => {
 });
 
 process.stdin.on("end", () => {
+  // A CLI wedged in a retry loop never notices its stdin closed. Reproducing
+  // that is what lets a test drive disposal past the polite stage and into the
+  // kill it is supposed to verify.
+  if (process.env.FAKE_IGNORE_STDIN_CLOSE === "1") {
+    // Ignoring the event is not enough to stay up: with stdin done there is
+    // nothing left holding the loop open, and node would exit anyway.
+    setInterval(() => {}, 1e9);
+    return;
+  }
   queue.then(() => process.exit(0));
 });

@@ -3,6 +3,7 @@ import { rmSync } from "node:fs";
 import { randomUUID } from "node:crypto";
 import type { Config } from "../core/config.ts";
 import { buildSpawnPlan, type SpawnPlan } from "./args.ts";
+import { isRunning, killTree } from "./reaper.ts";
 import { log } from "../util/log.ts";
 import {
   type ContentBlock,
@@ -84,6 +85,11 @@ function num(v: unknown): number {
   return typeof v === "number" && Number.isFinite(v) ? v : 0;
 }
 
+/** How long the CLI gets to flush and exit on its own after stdin closes. */
+const GRACE_MS = 1500;
+/** How long each escalation gets to take effect before the next one. */
+const VERIFY_MS = 2000;
+
 /**
  * On Windows a .cmd/.bat shim cannot be spawned directly (Node blocks it), so
  * route those through cmd.exe with verbatim arguments.
@@ -161,11 +167,24 @@ export class ClaudeProcess {
   #readyResolve: (() => void) | null = null;
   #ready: Promise<void>;
   #pendingControl = new Map<string, () => void>();
+  #disposed = false;
+  #goneResolve!: () => void;
+  /**
+   * Resolves once the OS process is confirmed gone — not merely once a kill has
+   * been asked for. The pool waits on this to know when it may stop tracking
+   * the pid.
+   */
+  readonly whenGone: Promise<void>;
+  /** Epoch ms at spawn, paired with the pid to identify it after a restart. */
+  readonly spawnedAt = Date.now();
 
   constructor(cfg: Config, cls: SessionClass, resumeSessionId?: string) {
     this.#cfg = cfg;
     this.cls = cls;
     this.key = randomUUID();
+    this.whenGone = new Promise<void>((resolve) => {
+      this.#goneResolve = resolve;
+    });
     this.#plan = buildSpawnPlan(cfg, cls, resumeSessionId);
     this.#ready = new Promise<void>((resolve) => {
       this.#readyResolve = resolve;
@@ -188,12 +207,16 @@ export class ClaudeProcess {
     });
     this.#child.on("error", (err: Error) => {
       this.alive = false;
+      // A spawn that never produced a process has nothing to clean up, and no
+      // `exit` is coming to say so.
+      if (this.#child.pid === undefined) this.#goneResolve();
       this.#failTurn(502, "upstream_error", `failed to launch ${cfg.claude.binary}: ${err.message}`);
       this.#readyResolve?.();
     });
     this.#child.on("exit", (code, signal) => {
       this.alive = false;
       this.#exitInfo = { code, signal };
+      this.#goneResolve();
       log.debug("claude exited", { key: this.key.slice(0, 8), code, signal });
       this.#failTurn(
         502,
@@ -222,6 +245,11 @@ export class ClaudeProcess {
 
   get idleMs(): number {
     return Date.now() - this.lastUsedAt;
+  }
+
+  /** The OS pid, or null if the spawn never produced one. */
+  get pid(): number | null {
+    return this.#child.pid ?? null;
   }
 
   #failTurn(status: number, type: string, message: string): void {
@@ -686,6 +714,8 @@ export class ClaudeProcess {
   }
 
   dispose(): void {
+    if (this.#disposed) return;
+    this.#disposed = true;
     this.alive = false;
     this.#failTurn(499, "aborted", "session disposed");
     try {
@@ -693,23 +723,106 @@ export class ClaudeProcess {
     } catch {
       /* already gone */
     }
-    if (this.#exitInfo === null) {
-      // Give the CLI a moment to flush and exit on its own before SIGKILL.
-      const child = this.#child;
-      const timer = setTimeout(() => {
-        try {
-          child.kill("SIGKILL");
-        } catch {
-          /* already gone */
-        }
-      }, 1500);
-      timer.unref?.();
-      child.once("exit", () => clearTimeout(timer));
-    }
+    void this.#terminate();
     try {
       rmSync(this.#plan.scratchDir, { recursive: true, force: true });
     } catch {
       /* best effort */
     }
+  }
+
+  /**
+   * Take the process down, checking at every step that it actually went.
+   *
+   * The old version fired one SIGKILL on a timer inside a swallowed catch: if
+   * the kill did not land there was no retry, no escalation, and no log line —
+   * and the session had already left the pool, so nothing would ever look at it
+   * again. Each stage here confirms the outcome before deciding the next, and
+   * the last one is loud, because a process that survives a tree kill is a fact
+   * somebody needs to see.
+   */
+  async #terminate(): Promise<void> {
+    const pid = this.pid;
+    const key = this.key.slice(0, 8);
+    if (pid === null) {
+      this.#goneResolve();
+      return;
+    }
+
+    // Closing stdin is the polite exit, and the one the CLI normally takes.
+    if (await this.#exited(GRACE_MS)) return;
+
+    this.sigkill();
+    if (await this.#exited(VERIFY_MS)) return;
+
+    // Still there. Either the signal did not land, or the CLI has children of
+    // its own holding the tree up — `child.kill()` on Windows only ever reaches
+    // the process we hold a handle to.
+    log.warn("claude survived SIGKILL; escalating to a tree kill", { key, pid });
+    try {
+      await killTree(pid);
+    } catch (err) {
+      log.debug("tree kill reported an error", {
+        key,
+        pid,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+    if (await this.#exited(VERIFY_MS)) return;
+
+    if (isRunning(pid)) {
+      log.error("claude process could not be killed; it is leaking", { key, pid });
+    } else {
+      // Gone, but Node never saw the exit — the pid is free either way.
+      this.#goneResolve();
+    }
+  }
+
+  /**
+   * The first kill, on the handle Node holds.
+   *
+   * Separated out so a test can make it miss: the whole point of the stages
+   * around it is that the escalation still happens when it does.
+   */
+  protected sigkill(): void {
+    try {
+      this.#child.kill("SIGKILL");
+    } catch (err) {
+      log.debug("SIGKILL threw", {
+        key: this.key.slice(0, 8),
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
+
+  /**
+   * Whether the process is gone within `ms`, resolving the moment it is.
+   *
+   * Timers here are unref'd so a pending kill can never hold the bridge open at
+   * exit; `SessionManager.shutdown` is what guarantees the kill still happens
+   * if the bridge leaves inside one of these windows.
+   */
+  #exited(ms: number): Promise<boolean> {
+    if (this.#exitInfo !== null) {
+      this.#goneResolve();
+      return Promise.resolve(true);
+    }
+    return new Promise<boolean>((resolve) => {
+      const onExit = () => {
+        clearTimeout(timer);
+        this.#goneResolve();
+        resolve(true);
+      };
+      const timer = setTimeout(() => {
+        this.#child.removeListener("exit", onExit);
+        // The `exit` event is the truth when Node sees it, but a process it
+        // never reaped can still be gone from the OS.
+        const gone = this.#exitInfo !== null || !isRunning(this.pid ?? -1);
+        if (gone) this.#goneResolve();
+        resolve(gone);
+      }, ms);
+      timer.unref?.();
+      this.#child.once("exit", onExit);
+    });
   }
 }
