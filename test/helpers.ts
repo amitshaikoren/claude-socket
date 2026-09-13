@@ -4,7 +4,7 @@ import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import type { AddressInfo } from "node:net";
 import { defaultConfig, type Config } from "../src/core/config.ts";
-import { SessionManager } from "../src/claude/sessions.ts";
+import { SessionManager } from "../src/agent/sessions.ts";
 import { createSocketServer } from "../src/http/server.ts";
 import { MemoryUsageStore, type UsageStore } from "../src/core/store.ts";
 import { emptyToolPolicy, type SessionClass } from "../src/core/types.ts";
@@ -36,6 +36,7 @@ export function testConfig(overrides: Partial<Config> = {}): Config {
 /** A session class with the boring fields filled in. */
 export function testClass(overrides: Partial<SessionClass> = {}): SessionClass {
   return {
+    provider: "claude",
     mode: "oracle",
     model: "claude-sonnet-5",
     systemPrompt: "",

@@ -113,7 +113,8 @@ describe("tool policy resolution", () => {
     const custom = testConfig();
     custom.models = [
       {
-        id: "reader",
+        provider: "claude",
+      id: "reader",
         model: "claude-sonnet-5",
         mode: "semi",
         effort: null,

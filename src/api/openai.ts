@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { sandboxFor } from "../codex/args.ts";
 import type { Ctx } from "../http/context.ts";
 import { sendJson } from "../http/context.ts";
 import { SseWriter } from "../http/sse.ts";
@@ -525,10 +526,14 @@ export function handleModels(ctx: Ctx): void {
         created,
         owned_by: m.ownedBy,
         context_window: m.contextWindow,
-        // Non-standard, but the two things a client of this server wants to
-        // know: how much agent it gets, and which tools that agent may run.
+        // Non-standard, but the three things a client of this server wants to
+        // know: which CLI answers, how much agent it gets, and what that agent
+        // may run. Codex has no tool list to report — its access is the
+        // sandbox — so it reports that instead.
+        provider: m.provider,
         mode: m.mode,
-        tools: m.tools !== undefined ? m.tools : (section?.tools ?? null),
+        tools: m.provider === "codex" ? null : (m.tools !== undefined ? m.tools : (section?.tools ?? null)),
+        sandbox: m.provider === "codex" ? sandboxFor(cfg, m.mode) : null,
       };
     }),
   });

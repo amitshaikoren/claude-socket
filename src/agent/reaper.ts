@@ -249,6 +249,24 @@ export class ChildRegistry {
     if (this.#entries.delete(pid)) this.#schedule();
   }
 
+  /**
+   * Forget recorded pids that are neither still ours nor still running.
+   *
+   * A driver that spawns a child per turn records a new pid every turn and
+   * never has an obvious moment to retract the last one. Nothing breaks if they
+   * pile up — `survivors` checks start times, so a recycled pid is never
+   * mistaken for ours — but the file would grow all session, so the reap tick
+   * sweeps it instead.
+   */
+  prune(keep: ReadonlySet<number>): void {
+    for (const pid of [...this.#entries.keys()]) {
+      if (keep.has(pid) || isRunning(pid)) continue;
+      this.#entries.delete(pid);
+      this.#dirty = true;
+    }
+    if (this.#dirty) this.#schedule();
+  }
+
   /** Coalesced: a burst of spawns costs one write, not one per process. */
   #schedule(): void {
     this.#dirty = true;

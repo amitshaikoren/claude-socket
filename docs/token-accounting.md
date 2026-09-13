@@ -9,6 +9,14 @@ ask for another — and **every lap is a separately billed request**. The CLI's 
 assistant message instead. That is the only place a per-call number exists, and it is what
 makes "what did this message / turn / tool call cost" answerable at all.
 
+The same holds on the `codex` backend, by a different road: `codex exec --json` publishes
+only a turn total, so the per-call numbers are read out of the session transcript the CLI
+writes under `CODEX_HOME/sessions`. Everything below — the vocabulary, the attribution, the
+dashboard — is identical once those numbers exist. Two caveats specific to it: Codex counts
+cached and cache-written tokens *inside* `input_tokens` and the socket subtracts them back
+out, and Codex reports no price, so `cost_usd` stays zero rather than becoming a guess.
+→ [The codex backend](developers.md#the-codex-backend)
+
 Three granularities, all from measured usage rather than estimation:
 
 | Level | What it is |

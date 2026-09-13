@@ -147,19 +147,26 @@ async function cmdSessions(options: Options): Promise<void> {
   }
   const rows = sessions.map((s: any) => [
     (s.sessionId ?? "").slice(0, 8),
+    s.provider ?? "claude",
     s.mode,
     s.model,
     String(s.turns),
     usd(s.costUsd),
     s.busy ? "busy" : `${s.idleSeconds}s idle`,
   ]);
-  stdout.write(table(rows, ["ID", "MODE", "MODEL", "TURNS", "COST", "STATE"]) + "\n");
+  stdout.write(table(rows, ["ID", "BACKEND", "MODE", "MODEL", "TURNS", "COST", "STATE"]) + "\n");
 }
 
 async function cmdModels(options: Options): Promise<void> {
   const { data } = await api(options, "/v1/models");
-  const rows = data.map((m: any) => [m.id, m.mode, num(m.context_window), m.owned_by]);
-  stdout.write(table(rows, ["ID", "MODE", "CONTEXT", "OWNED BY"]) + "\n");
+  const rows = data.map((m: any) => [
+    m.id,
+    m.provider ?? "claude",
+    m.mode,
+    num(m.context_window),
+    m.owned_by,
+  ]);
+  stdout.write(table(rows, ["ID", "BACKEND", "MODE", "CONTEXT", "OWNED BY"]) + "\n");
 }
 
 async function cmdKill(options: Options): Promise<void> {

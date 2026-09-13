@@ -1,70 +1,23 @@
-import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
+import type { ChildProcessWithoutNullStreams } from "node:child_process";
 import { rmSync } from "node:fs";
 import { randomUUID } from "node:crypto";
 import type { Config } from "../core/config.ts";
 import { buildSpawnPlan, type SpawnPlan } from "./args.ts";
-import { isRunning, killTree } from "./reaper.ts";
+import { isRunning, killTree } from "../agent/reaper.ts";
+import { EventQueue, single } from "../agent/queue.ts";
+import { isRecord, num, spawnCli } from "../agent/spawn.ts";
 import { log } from "../util/log.ts";
 import {
+  type AgentProcess,
   type ContentBlock,
   type RateLimitInfo,
   type SessionClass,
+  type SpawnListener,
   type TurnEvent,
   type Usage,
 } from "../core/types.ts";
 import { rollUp, type Step, type StepTool } from "../core/usage.ts";
 import { summarizeToolInput } from "../core/activity.ts";
-
-/** Async queue that turns pushed events into an async iterable. */
-class EventQueue {
-  #items: TurnEvent[] = [];
-  #waiter: ((v: IteratorResult<TurnEvent>) => void) | null = null;
-  #closed = false;
-
-  push(event: TurnEvent): void {
-    if (this.#closed) return;
-    if (this.#waiter) {
-      const w = this.#waiter;
-      this.#waiter = null;
-      w({ value: event, done: false });
-    } else {
-      this.#items.push(event);
-    }
-  }
-
-  close(): void {
-    if (this.#closed) return;
-    this.#closed = true;
-    if (this.#waiter) {
-      const w = this.#waiter;
-      this.#waiter = null;
-      w({ value: undefined as unknown as TurnEvent, done: true });
-    }
-  }
-
-  get closed(): boolean {
-    return this.#closed;
-  }
-
-  async *drain(): AsyncGenerator<TurnEvent> {
-    for (;;) {
-      if (this.#items.length > 0) {
-        yield this.#items.shift()!;
-        continue;
-      }
-      if (this.#closed) return;
-      const next = await new Promise<IteratorResult<TurnEvent>>((resolve) => {
-        this.#waiter = resolve;
-      });
-      if (next.done) return;
-      yield next.value;
-    }
-  }
-}
-
-function isRecord(v: unknown): v is Record<string, unknown> {
-  return typeof v === "object" && v !== null && !Array.isArray(v);
-}
 
 /** A `tool_use` block, before its arguments are dropped for storage. */
 interface RequestedTool extends StepTool {
@@ -76,53 +29,10 @@ function toStepTool(tool: RequestedTool): StepTool {
   return { id: tool.id, name: tool.name, summary: tool.summary };
 }
 
-/** A one-event stream, for turns that fail before they can start. */
-async function* single(event: TurnEvent): AsyncGenerator<TurnEvent> {
-  yield event;
-}
-
-function num(v: unknown): number {
-  return typeof v === "number" && Number.isFinite(v) ? v : 0;
-}
-
 /** How long the CLI gets to flush and exit on its own after stdin closes. */
 const GRACE_MS = 1500;
 /** How long each escalation gets to take effect before the next one. */
 const VERIFY_MS = 2000;
-
-/**
- * On Windows a .cmd/.bat shim cannot be spawned directly (Node blocks it), so
- * route those through cmd.exe with verbatim arguments.
- */
-function spawnCli(
-  binary: string,
-  args: string[],
-  cwd: string,
-  env: Record<string, string>,
-  unsetEnv: string[] = [],
-): ChildProcessWithoutNullStreams {
-  const childEnv: Record<string, string | undefined> = { ...process.env, ...env };
-  for (const name of unsetEnv) delete childEnv[name];
-
-  const options = {
-    cwd,
-    env: childEnv,
-    stdio: ["pipe", "pipe", "pipe"] as Array<"pipe">,
-    windowsHide: true,
-  };
-
-  if (process.platform === "win32" && /\.(cmd|bat)$/i.test(binary)) {
-    const quoted = [binary, ...args]
-      .map((a) => `"${a.replace(/"/g, '""')}"`)
-      .join(" ");
-    return spawn("cmd.exe", ["/d", "/s", "/c", quoted], {
-      ...options,
-      windowsVerbatimArguments: true,
-    }) as ChildProcessWithoutNullStreams;
-  }
-
-  return spawn(binary, args, options) as ChildProcessWithoutNullStreams;
-}
 
 /**
  * A single long-lived `claude` CLI process.
@@ -131,7 +41,7 @@ function spawnCli(
  * keeps the conversation in its own context, so each follow-up turn sends only
  * the new message instead of replaying the transcript.
  */
-export class ClaudeProcess {
+export class ClaudeProcess implements AgentProcess {
   readonly key: string;
   readonly cls: SessionClass;
   sessionId: string | null = null;
@@ -178,14 +88,14 @@ export class ClaudeProcess {
   /** Epoch ms at spawn, paired with the pid to identify it after a restart. */
   readonly spawnedAt = Date.now();
 
-  constructor(cfg: Config, cls: SessionClass, resumeSessionId?: string) {
+  constructor(cfg: Config, cls: SessionClass, onSpawn?: SpawnListener) {
     this.#cfg = cfg;
     this.cls = cls;
     this.key = randomUUID();
     this.whenGone = new Promise<void>((resolve) => {
       this.#goneResolve = resolve;
     });
-    this.#plan = buildSpawnPlan(cfg, cls, resumeSessionId);
+    this.#plan = buildSpawnPlan(cfg, cls);
     this.#ready = new Promise<void>((resolve) => {
       this.#readyResolve = resolve;
     });
@@ -198,6 +108,7 @@ export class ClaudeProcess {
       this.#plan.env,
       this.#plan.unsetEnv,
     );
+    if (this.#child.pid !== undefined) onSpawn?.(this.#child.pid, this.spawnedAt);
 
     this.#child.stdout.setEncoding("utf8");
     this.#child.stdout.on("data", (chunk: string) => this.#onStdout(chunk));
@@ -250,6 +161,12 @@ export class ClaudeProcess {
   /** The OS pid, or null if the spawn never produced one. */
   get pid(): number | null {
     return this.#child.pid ?? null;
+  }
+
+  /** One process, for the whole life of the session. */
+  pids(): number[] {
+    const pid = this.pid;
+    return pid === null ? [] : [pid];
   }
 
   #failTurn(status: number, type: string, message: string): void {

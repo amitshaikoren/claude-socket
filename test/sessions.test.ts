@@ -6,7 +6,7 @@ import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { startTestServer, authHeaders, testConfig, testClass, type TestServer } from "./helpers.ts";
 import { buildSpawnPlan } from "../src/claude/args.ts";
-import { renderSeed } from "../src/claude/sessions.ts";
+import { renderSeed } from "../src/agent/sessions.ts";
 
 /**
  * The fake CLI answers "echo<N>: ..." where N counts turns inside one process,

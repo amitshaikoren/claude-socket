@@ -5,9 +5,9 @@ import { mkdtempSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { startTestServer, authHeaders, testConfig, testClass, FAKE_CLI } from "./helpers.ts";
-import { SessionManager } from "../src/claude/sessions.ts";
+import { SessionManager } from "../src/agent/sessions.ts";
 import { ClaudeProcess } from "../src/claude/process.ts";
-import { isRunning, listChildren } from "../src/claude/reaper.ts";
+import { isRunning, listChildren } from "../src/agent/reaper.ts";
 import type { Config } from "../src/core/config.ts";
 
 /**
