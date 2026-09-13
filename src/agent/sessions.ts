@@ -1,6 +1,8 @@
 import { mkdirSync } from "node:fs";
 import type { Config } from "../core/config.ts";
-import { ClaudeProcess } from "./process.ts";
+import { ClaudeProcess } from "../claude/process.ts";
+import { CodexProcess } from "../codex/process.ts";
+import { sandboxFor } from "../codex/args.ts";
 import { ChildRegistry, killTree, killTreeSync, listChildren } from "./reaper.ts";
 import { Mutex } from "../util/mutex.ts";
 import { chain, sha256 } from "../util/hash.ts";
@@ -9,6 +11,8 @@ import { telemetry } from "../core/telemetry.ts";
 import { formatToolUse } from "../core/activity.ts";
 import { isAgentic, toolPolicyKey } from "../core/types.ts";
 import type {
+  AgentProcess,
+  SpawnListener,
   SocketMessage,
   SocketRequest,
   ContentBlock,
@@ -17,7 +21,7 @@ import type {
 } from "../core/types.ts";
 
 interface Entry {
-  proc: ClaudeProcess;
+  proc: AgentProcess;
   mutex: Mutex;
   /** Hash of the conversation prefix this process has already consumed. */
   chainKey: string;
@@ -35,6 +39,8 @@ function canonicalMessage(msg: SocketMessage): string {
 function classKey(cls: SessionClass): string {
   return sha256(
     JSON.stringify([
+      // Two CLIs never share a conversation, whatever else matches.
+      cls.provider,
       cls.mode,
       cls.model,
       cls.systemPrompt,
@@ -155,7 +161,10 @@ export class SessionManager {
   #trackedPids(): Set<number> {
     const pids = new Set<number>();
     for (const entry of this.#entries) {
-      if (entry.proc.pid !== null) pids.add(entry.proc.pid);
+      // Not `pid`: a per-turn driver owns a different child each turn, and
+      // asking it for the whole set is what keeps the sweep from mistaking a
+      // live one for an orphan.
+      for (const pid of entry.proc.pids()) pids.add(pid);
     }
     const now = Date.now();
     for (const [pid, deadline] of this.#disposing) {
@@ -249,6 +258,7 @@ export class SessionManager {
     return [...this.#entries].map((e) => ({
       sessionId: e.proc.sessionId,
       pid: e.proc.pid,
+      provider: e.proc.cls.provider,
       mode: e.proc.cls.mode,
       model: e.proc.cls.model,
       turns: e.proc.turns,
@@ -256,9 +266,12 @@ export class SessionManager {
       idleSeconds: Math.round(e.proc.idleMs / 1000),
       busy: e.mutex.locked,
       alive: e.proc.alive,
-      // `null` means the CLI's own default set, which is the harness case.
+      // `null` means the CLI's own default set, which is the harness case — or,
+      // on codex, that there is no tool list at all and `sandbox` is the answer
+      // to the same question.
       tools: e.proc.cls.tools.tools,
       disallowedTools: e.proc.cls.tools.disallowed,
+      sandbox: e.proc.cls.provider === "codex" ? sandboxFor(this.#cfg, e.proc.cls.mode) : null,
     }));
   }
 
@@ -295,6 +308,7 @@ export class SessionManager {
     // processes against a cap of 16, until the idle timeout got to them a
     // quarter of an hour later. The cap is checked here too, once they are idle.
     this.#trim(this.#cfg.sessions.max, "over capacity");
+    this.#registry.prune(this.#trackedPids());
     void this.sweepOrphans();
   }
 
@@ -305,14 +319,16 @@ export class SessionManager {
     // Held back from the orphan sweep only for as long as an honest disposal
     // takes; past that the sweep is welcome to it, because a disposal that has
     // not landed by then is itself the leak.
-    const pid = entry.proc.pid;
-    if (pid !== null) this.#disposing.set(pid, Date.now() + DISPOSAL_GRACE_MS);
+    for (const pid of entry.proc.pids()) {
+      this.#disposing.set(pid, Date.now() + DISPOSAL_GRACE_MS);
+    }
     entry.proc.dispose();
     log.debug("session dropped", { reason, sessionId: entry.proc.sessionId?.slice(0, 8) });
     telemetry.emit("session", {
       action: "drop",
       reason,
       sessionId: entry.proc.sessionId,
+      provider: entry.proc.cls.provider,
       mode: entry.proc.cls.mode,
       model: entry.proc.cls.model,
       turns: entry.proc.turns,
@@ -377,22 +393,33 @@ export class SessionManager {
    */
   #create(req: SocketRequest): Entry {
     this.#evictIfNeeded();
-    if (isAgentic(req.cls.mode)) mkdirSync(req.cls.cwd, { recursive: true });
+    // Codex needs the directory to exist in every mode, not just the agentic
+    // ones: its oracle sessions get a real sandbox root rather than a working
+    // directory nothing can reach. See `oracleCwd` in resolve.ts.
+    if (isAgentic(req.cls.mode) || req.cls.provider === "codex") {
+      mkdirSync(req.cls.cwd, { recursive: true });
+    }
 
-    const proc = new ClaudeProcess(this.#cfg, req.cls);
+    // On disk before the process can matter, so a bridge that dies without
+    // running its shutdown path still leaves the next one enough to find it.
+    // The driver calls this rather than the pool reading `pid` once, because a
+    // per-turn driver has a new child — and a new pid to record — every turn.
+    const onSpawn: SpawnListener = (pid, spawnedAt) => this.#registry.add(pid, spawnedAt);
+
+    const proc: AgentProcess =
+      req.cls.provider === "codex"
+        ? new CodexProcess(this.#cfg, req.cls, onSpawn)
+        : new ClaudeProcess(this.#cfg, req.cls, onSpawn);
+
     const entry: Entry = { proc, mutex: new Mutex(), chainKey: classKey(req.cls) };
     this.#entries.add(entry);
 
-    const pid = proc.pid;
-    if (pid !== null) {
-      // On disk before the process can matter, so a bridge that dies without
-      // running its shutdown path still leaves the next one enough to find it.
-      this.#registry.add(pid, proc.spawnedAt);
-      void proc.whenGone.then(() => {
+    void proc.whenGone.then(() => {
+      for (const pid of proc.pids()) {
         this.#registry.remove(pid);
         this.#disposing.delete(pid);
-      });
-    }
+      }
+    });
     return entry;
   }
 
@@ -482,6 +509,7 @@ export class SessionManager {
             telemetry.emit("session", {
               action: "create",
               sessionId: proc.sessionId,
+              provider: proc.cls.provider,
               mode: proc.cls.mode,
               model: proc.cls.model,
               cwd: proc.cls.cwd,
@@ -525,9 +553,7 @@ export class SessionManager {
   shutdown(): void {
     this.#closed = true;
     clearInterval(this.#reaper);
-    const pids = [...this.#entries]
-      .map((e) => e.proc.pid)
-      .filter((p): p is number => p !== null);
+    const pids = [...this.#entries].flatMap((e) => e.proc.pids());
     for (const entry of [...this.#entries]) this.#drop(entry, "shutdown");
     // Every timer disposal relies on is unref'd, so the bridge may well be gone
     // before any of them fires — which is how a restart inside the kill window

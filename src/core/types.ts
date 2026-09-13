@@ -24,6 +24,23 @@ export function isAgentic(mode: Mode): boolean {
   return mode === "harness" || mode === "semi";
 }
 
+/**
+ * Which CLI answers a request.
+ *
+ * The two are not interchangeable and the socket does not pretend otherwise:
+ * `claude` can be stripped to a bare completion endpoint and handed an exact
+ * tool list, `codex` can only be handed a sandbox. What they do share is a
+ * conversation that survives between turns and per-model-call token
+ * accounting, and that is what the rest of the socket is written against.
+ */
+export type Provider = "claude" | "codex";
+
+export const PROVIDERS: readonly Provider[] = ["claude", "codex"];
+
+export function isProvider(value: unknown): value is Provider {
+  return value === "claude" || value === "codex";
+}
+
 export type BlockType = "text" | "thinking";
 
 /** Normalized token accounting for one turn. */
@@ -99,6 +116,7 @@ export type ImageSource =
  * process when their whole session class matches.
  */
 export interface SessionClass {
+  provider: Provider;
   mode: Mode;
   model: string;
   systemPrompt: string;
@@ -153,3 +171,49 @@ export class SocketError extends Error {
     this.type = type;
   }
 }
+
+/**
+ * One conversation, held open by whichever CLI is behind it.
+ *
+ * The two drivers keep a session alive by different means and the pool does not
+ * need to know which. `claude` holds one long-lived process and feeds it turns
+ * over stdin; `codex exec` is one process per turn, with continuity coming from
+ * `codex exec resume <thread>`. So "alive" here means *the conversation* is
+ * still usable, not that an OS process exists right now — which is why `pid`
+ * may legitimately be null between turns, and why the pool asks `pids()` rather
+ * than reading a single field when it reconciles against the operating system.
+ */
+export interface AgentProcess {
+  /** Stable identity for this session, independent of any OS pid. */
+  readonly key: string;
+  readonly cls: SessionClass;
+  /** The CLI's own id for the conversation; null until it reports one. */
+  sessionId: string | null;
+  lastUsedAt: number;
+  turns: number;
+  totalCostUsd: number;
+  rateLimit: RateLimitInfo | null;
+  alive: boolean;
+  /** Epoch ms at creation, paired with a pid to identify it after a restart. */
+  readonly spawnedAt: number;
+  /** Resolves once every process this session owns is confirmed gone. */
+  readonly whenGone: Promise<void>;
+  /** The current OS pid, or null when no child is running just now. */
+  readonly pid: number | null;
+  readonly idleMs: number;
+  /** Every pid this session is responsible for at this instant. */
+  pids(): number[];
+  /** Resolves once the CLI has reported its session id, or died trying. */
+  ready(timeoutMs?: number): Promise<void>;
+  runTurn(content: ContentBlock[]): AsyncGenerator<TurnEvent>;
+  abort(): Promise<void>;
+  dispose(): void;
+}
+
+/**
+ * Told by a driver whenever it spawns a child, so the pool can write the pid to
+ * the crash registry. A long-lived driver fires this once; a per-turn one fires
+ * it on every turn, which is exactly why the pool cannot just read `pid` at
+ * creation time and be done.
+ */
+export type SpawnListener = (pid: number, spawnedAt: number) => void;

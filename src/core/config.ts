@@ -1,7 +1,7 @@
 import { readFileSync, existsSync } from "node:fs";
 import { resolve, dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { isMode, type Mode } from "./types.ts";
+import { isMode, isProvider, type Mode, type Provider } from "./types.ts";
 import type { LogLevel } from "../util/log.ts";
 
 export const projectRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..", "..");
@@ -10,6 +10,8 @@ export const projectRoot = resolve(dirname(fileURLToPath(import.meta.url)), ".."
 export interface ModelEntry {
   /** What clients see and send in `model`. Rename freely to disguise the backend. */
   id: string;
+  /** Which CLI answers for it. */
+  provider: Provider;
   /** What the CLI is actually told via --model. */
   model: string;
   mode: Mode;
@@ -48,7 +50,52 @@ export interface Config {
   server: { host: string; port: number };
   auth: { tokens: string[]; required: boolean };
   claude: { binary: string; binaryArgs: string[]; extraArgs: string[]; env: Record<string, string> };
-  defaults: { mode: Mode; model: string; effort: string | null };
+  /**
+   * The `codex` backend.
+   *
+   * The mode sections above are shared — `workspaceRoot`, `allowedCwds` and the
+   * activity setting mean the same thing whichever CLI is behind a request — so
+   * only the settings that have no Claude equivalent live here.
+   */
+  codex: {
+    binary: string;
+    binaryArgs: string[];
+    extraArgs: string[];
+    env: Record<string, string>;
+    /**
+     * CODEX_HOME for spawned CLIs. Empty leaves the operator's own, which is
+     * deliberate: it is where the login lives, and `codex` rotates its refresh
+     * token on use — so a second copy of `auth.json` would eventually invalidate
+     * whichever one refreshed second, including the operator's own `codex`.
+     */
+    home: string;
+    /**
+     * Skip `$CODEX_HOME/config.toml`, so the operator's MCP servers, plugins and
+     * model defaults stay out of a bridge session. Auth still comes from
+     * CODEX_HOME either way.
+     */
+    ignoreUserConfig: boolean;
+    /**
+     * Extra `-c key=value` settings passed to every spawn. Mostly there to put
+     * back anything `ignoreUserConfig` takes away that a particular machine
+     * turns out to need.
+     */
+    configOverrides: Record<string, string>;
+    /**
+     * `model_reasoning_summary`. Empty leaves the CLI's default, which emits no
+     * reasoning text at all; `detailed` is what makes the thinking channel
+     * actually carry something.
+     */
+    reasoningSummary: string;
+    /** The sandbox each mode runs under — the only tool lever `codex exec` has. */
+    sandbox: Record<Mode, string>;
+    /**
+     * Read per-model-call usage back out of the session transcript. Off falls
+     * back to the turn aggregate, which costs the per-tool-call attribution.
+     */
+    readRollout: boolean;
+  };
+  defaults: { provider: Provider; mode: Mode; model: string; effort: string | null };
   oracle: {
     systemPrompt: string;
     settingSources: string;
@@ -110,11 +157,22 @@ export interface Config {
   logLevel: LogLevel;
 }
 
-const BASE_MODELS: Array<{ model: string; context: number }> = [
-  { model: "claude-opus-5", context: 500_000 },
-  { model: "claude-sonnet-5", context: 1_000_000 },
-  { model: "claude-fable-5", context: 200_000 },
-  { model: "claude-haiku-4-5", context: 200_000 },
+interface BaseModel {
+  provider: Provider;
+  model: string;
+  context: number;
+  ownedBy: string;
+}
+
+const BASE_MODELS: BaseModel[] = [
+  { provider: "claude", model: "claude-opus-5", context: 500_000, ownedBy: "anthropic" },
+  { provider: "claude", model: "claude-sonnet-5", context: 1_000_000, ownedBy: "anthropic" },
+  { provider: "claude", model: "claude-fable-5", context: 200_000, ownedBy: "anthropic" },
+  { provider: "claude", model: "claude-haiku-4-5", context: 200_000, ownedBy: "anthropic" },
+  { provider: "codex", model: "gpt-6-astra", context: 272_000, ownedBy: "openai" },
+  { provider: "codex", model: "gpt-5.6-sol", context: 272_000, ownedBy: "openai" },
+  { provider: "codex", model: "gpt-5.6-terra", context: 272_000, ownedBy: "openai" },
+  { provider: "codex", model: "gpt-5.5", context: 272_000, ownedBy: "openai" },
 ];
 
 /**
@@ -127,24 +185,41 @@ export const READ_ONLY_TOOLS = ["Read", "Glob", "Grep", "WebFetch", "WebSearch",
 /** Mode suffix on an advertised model id. */
 const MODE_SUFFIX: Record<Mode, string> = { oracle: "", harness: "-harness", semi: "-semi" };
 
+/**
+ * Guess which CLI a model name belongs to.
+ *
+ * Only ever a fallback, for a catalog entry or a default that names a model but
+ * no provider. Anything unrecognized stays on the configured default rather
+ * than being routed somewhere on a hunch.
+ */
+export function providerOfModel(model: string, fallback: Provider): Provider {
+  if (/^claude-/i.test(model)) return "claude";
+  if (/^(gpt|o[0-9]|codex-)/i.test(model)) return "codex";
+  return fallback;
+}
+
 function defaultModels(defaults: Config["defaults"]): ModelEntry[] {
   const entries: ModelEntry[] = [];
   for (const base of BASE_MODELS) {
     for (const mode of ["oracle", "harness", "semi"] as Mode[]) {
       entries.push({
         id: base.model + MODE_SUFFIX[mode],
+        provider: base.provider,
         model: base.model,
         mode,
         effort: null,
         contextWindow: base.context,
-        ownedBy: "local",
+        ownedBy: base.ownedBy,
       });
     }
   }
-  // Convenience aliases so a client can just ask for the mode by name.
+  // Convenience aliases so a client can just ask for the mode by name. These
+  // follow the configured default provider, so pointing the socket at `codex`
+  // does not leave `semi` quietly answering from Claude.
   for (const mode of ["oracle", "harness", "semi"] as Mode[]) {
     entries.push({
       id: mode,
+      provider: defaults.provider,
       model: defaults.model,
       mode,
       effort: defaults.effort,
@@ -156,11 +231,28 @@ function defaultModels(defaults: Config["defaults"]): ModelEntry[] {
 }
 
 export function defaultConfig(): Config {
-  const defaults: Config["defaults"] = { mode: "oracle", model: "claude-sonnet-5", effort: null };
+  const defaults: Config["defaults"] = {
+    provider: "claude",
+    mode: "oracle",
+    model: "claude-sonnet-5",
+    effort: null,
+  };
   return {
     server: { host: "127.0.0.1", port: 8787 },
     auth: { tokens: [], required: true },
     claude: { binary: "claude", binaryArgs: [], extraArgs: [], env: {} },
+    codex: {
+      binary: "codex",
+      binaryArgs: [],
+      extraArgs: [],
+      env: {},
+      home: "",
+      ignoreUserConfig: true,
+      configOverrides: {},
+      reasoningSummary: "detailed",
+      sandbox: { oracle: "read-only", semi: "read-only", harness: "workspace-write" },
+      readRollout: true,
+    },
     defaults,
     oracle: {
       systemPrompt: "You are a helpful assistant.",
@@ -253,6 +345,12 @@ export function loadConfig(configPath?: string): Config {
     if (hadModels) {
       cfg.models = (parsed["models"] as Array<Record<string, unknown>>).map((m) => ({
         id: String(m["id"]),
+        // An entry that names no provider is inferred from its model id, so an
+        // older config file that predates the second backend keeps working and
+        // a new one can just say `"model": "gpt-6-astra"`.
+        provider: isProvider(m["provider"])
+          ? m["provider"]
+          : providerOfModel(String(m["model"] ?? cfg.defaults.model), cfg.defaults.provider),
         model: String(m["model"] ?? cfg.defaults.model),
         mode: isMode(m["mode"]) ? m["mode"] : "oracle",
         effort: m["effort"] == null ? null : String(m["effort"]),
@@ -279,6 +377,9 @@ export function loadConfig(configPath?: string): Config {
   if (process.env["SOCKET_NO_USAGE_DB"] === "1") cfg.usage.persist = false;
   if (process.env["SOCKET_MODEL"]) cfg.defaults.model = process.env["SOCKET_MODEL"];
   if (process.env["SOCKET_CLAUDE_BIN"]) cfg.claude.binary = process.env["SOCKET_CLAUDE_BIN"];
+  if (process.env["SOCKET_CODEX_BIN"]) cfg.codex.binary = process.env["SOCKET_CODEX_BIN"];
+  if (process.env["CODEX_HOME"] && !cfg.codex.home) cfg.codex.home = process.env["CODEX_HOME"];
+  if (isProvider(process.env["SOCKET_PROVIDER"])) cfg.defaults.provider = process.env["SOCKET_PROVIDER"];
   if (process.env["SOCKET_LOG_LEVEL"]) cfg.logLevel = process.env["SOCKET_LOG_LEVEL"] as LogLevel;
   if (process.env["SOCKET_NO_AUTH"] === "1") cfg.auth.required = false;
 
@@ -302,13 +403,18 @@ export function resolveModel(cfg: Config, requested: string | undefined): ModelE
       : id.endsWith("-semi")
         ? "semi"
         : cfg.defaults.mode;
+    // An unknown id that still names a recognizable model goes to that model's
+    // own backend, so a client configured with a bare `gpt-5.6-sol` reaches
+    // codex rather than quietly getting the default Claude.
+    const known = BASE_MODELS.find((b) => b.model === id);
     entry = {
       id: id || cfg.defaults.model,
-      model: cfg.defaults.model,
+      provider: known?.provider ?? cfg.defaults.provider,
+      model: known?.model ?? cfg.defaults.model,
       mode,
       effort: cfg.defaults.effort,
-      contextWindow: 200_000,
-      ownedBy: "local",
+      contextWindow: known?.context ?? 200_000,
+      ownedBy: known?.ownedBy ?? "local",
     };
   }
   if (effortPart) entry = { ...entry, effort: effortPart };

@@ -1,6 +1,6 @@
 import { test, describe } from "node:test";
 import assert from "node:assert/strict";
-import { SessionManager } from "../src/claude/sessions.ts";
+import { SessionManager } from "../src/agent/sessions.ts";
 import { testConfig, testClass } from "./helpers.ts";
 import { extractToolCalls } from "../src/core/tools.ts";
 import { ReplyStream } from "../src/core/tools.ts";

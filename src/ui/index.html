@@ -372,7 +372,9 @@
       return;
     }
     const rows = list.map((s) => {
-      const tools = s.tools ? s.tools.join(", ") : "all";
+      // Codex has no tool list; its sandbox answers the same question, and
+      // showing "all" for it would claim something untrue in both directions.
+      const tools = s.sandbox ? `sandbox: ${s.sandbox}` : s.tools ? s.tools.join(", ") : "all";
       return `
       <tr>
         <td title="${esc(s.sessionId)}">${esc((s.sessionId || "").slice(0, 8))}</td>

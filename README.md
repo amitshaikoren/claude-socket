@@ -1,13 +1,13 @@
 # claude-socket
 
-**An OpenAI/Anthropic-shaped socket in front of your own Claude Code install — one that
-tells you what each tool call in an agent loop actually cost.**
+**An OpenAI/Anthropic-shaped socket in front of your own Claude Code and Codex installs —
+one that tells you what each tool call in an agent loop actually cost.**
 
 Building agentic flows normally means the API: a separate key, metered per token, a bill
 that grows with every tool loop and dead end. But your machine already has an
-authenticated `claude` CLI sitting there. This puts a socket in front of it, so your
-scripts, agents and eval harnesses drive it like any hosted model — on the auth you
-already have.
+authenticated `claude` CLI sitting there — and, very likely, an authenticated `codex` one
+next to it. This puts a socket in front of them, so your scripts, agents and eval
+harnesses drive either like any hosted model — on the auth you already have.
 
 And a turn is not a call. It's a model call, a tool call, another model call, a dead end,
 a retry — and what you normally get back is a single usage total once the dust settles,
@@ -30,22 +30,29 @@ client.chat.completions.create(model="claude-sonnet-5",         # plain completi
 
 client.chat.completions.create(model="claude-sonnet-5-semi",    # read-only agent
     messages=[{"role": "user", "content": "why is the build slow?"}])
+
+client.chat.completions.create(model="gpt-5.6-sol",             # ...or ChatGPT, same socket
+    messages=[{"role": "user", "content": "What is 6*7?"}])
 ```
 
-That's it. Node 24+, a working `claude` CLI, zero runtime dependencies.
+That's it. Node 24+, a working `claude` or `codex` CLI, zero runtime dependencies.
 
 ## What you get
 
 - **Token accounting that survives a tool loop.** A turn is many billed calls; the socket
   measures each one and attributes tokens to individual tool calls. Charted, filterable,
-  persisted, and drillable down to the call. → [Token accounting](docs/token-accounting.md)
+  persisted, and drillable down to the call — on both backends. → [Token accounting](docs/token-accounting.md)
+- **Two backends, one socket.** `claude-*` models go to Claude Code, `gpt-*` models to
+  Codex, on whichever plan logins you already have. Same endpoints, same modes, same
+  accounting; the differences between the two CLIs are documented rather than papered
+  over. → [The second backend](#the-second-backend-codex)
 - **A read-only agent is a first-class mode.** Not tools-on/tools-off: `semi` lets the
   agent run its own loop over a tool set you choose — read-only unless you widen it — so
   you can let it investigate without letting it act. `oracle` and `harness` sit either
   side. Pick per request; hand it tools of your own in any of them.
 - **It doesn't re-pay for your history.** Stateless clients resend the whole conversation
-  every turn; the socket keeps a live CLI process per conversation and sends only the new
-  message — no `session_id` for your client to track. → [Session reuse](docs/developers.md#not-wasting-tokens)
+  every turn; the socket keeps the conversation open on the CLI side and sends only the
+  new message — no `session_id` for your client to track. → [Session reuse](docs/developers.md#not-wasting-tokens)
 - **Both dialects, properly.** Streaming, tool calling, `response_format`, images — over
   `/v1/chat/completions` and `/v1/messages`.
 - **A streamed reply says the same thing as a non-streamed one.** Reassembled deltas match
@@ -54,7 +61,9 @@ That's it. Node 24+, a working `claude` CLI, zero runtime dependencies.
   → [Grounding on a streamed reply](docs/developers.md#grounding-on-a-streamed-reply)
 
 The constraint moves rather than disappears: you spend plan capacity, so the ceiling is
-your **rate limits**, which the socket surfaces at `/health` and `/admin/stats`.
+your **rate limits**. The Claude CLI reports those, and the socket surfaces them at
+`/health` and `/admin/stats`; Codex does not report them on this transport, so a Codex-only
+socket has nothing to show there.
 
 ```
   OpenAI SDK ─┐
@@ -118,6 +127,66 @@ independent of the above.
 
 → [Modes, tool policy and the model catalog](docs/developers.md#models-and-disguising-the-backend)
 
+## The second backend: Codex
+
+Ask for a `gpt-*` model and the socket drives your `codex` CLI instead of `claude`. Same
+endpoints, same three modes, same per-tool-call accounting, same session reuse.
+
+```bash
+curl ... -d '{"model":"gpt-5.6-sol","messages":[...]}'          # completion
+curl ... -d '{"model":"gpt-5.6-sol-semi","messages":[...]}'     # read-only agent
+```
+
+The model id decides the backend, so nothing is ambiguous and `X-Claude-Mode` moves a
+request between modes but never between CLIs. Set `defaults.provider` to `codex` to point
+the bare `oracle`/`semi`/`harness` aliases at it too:
+
+```bash
+npm start                                   # both backends, if both CLIs are installed
+node src/index.ts --provider codex          # ...and the bare aliases go to codex
+node src/index.ts --codex-bin /path/to/codex
+
+node src/cli.ts models     # ID / BACKEND / MODE / CONTEXT — which CLI answers for what
+node src/cli.ts sessions   # live sessions; a codex one shows no pid between turns
+```
+
+A missing CLI is a warning at boot, not a failure — `claude`-only and `codex`-only installs
+both work, and the half of the catalog that has a backend still serves.
+
+**The two CLIs are not the same shape, and the socket does not pretend otherwise.**
+
+| | `claude` | `codex` |
+| --- | --- | --- |
+| Tool control | an exact `--tools` allowlist | a sandbox, and nothing finer |
+| `oracle` means | genuinely no tools | a read-only sandbox it rarely uses |
+| System prompt | a CLI flag | folded into the first message |
+| Streaming | token deltas | whole messages, one delta each |
+| Thinking text | arrives redacted to nothing | actually arrives |
+| Rate limits | reported | not on this transport |
+| Cost in USD | reported by the CLI | not reported, so left at zero |
+
+Two of those are worth saying twice. **`oracle` on Codex is a weaker promise**: there is no
+way to strip `codex exec` of its shell, so an oracle session still has a read-only sandbox
+and Codex's own coding-agent preamble underneath your system prompt. It answers like a
+completion endpoint in practice, but it is not one by construction the way the Claude
+oracle is. And **`X-Claude-Tools` is rejected, not ignored**, for `gpt-*` models — accepting
+it silently would leave you believing you had restricted an agent that still holds
+everything it started with.
+
+Your `codex` login is used where it lives: the socket never copies `auth.json`, because
+Codex rotates its refresh token on use and a second copy would eventually invalidate
+whichever one refreshed second — including your own `codex`. It does pass
+`--ignore-user-config` by default, so your MCP servers, plugins and model default stay out
+of bridge sessions; on Windows it reads back and re-applies the one thing that discards
+which you actually need, the `[windows] sandbox` setup, without which every command the
+agent runs is silently refused.
+
+Per-model-call accounting comes from the session transcript under `CODEX_HOME/sessions`,
+because `codex exec --json` reports only a turn total on the wire. If that cannot be read,
+a turn records as one step instead of several — coarser, never wrong.
+
+→ [The codex backend in detail](docs/developers.md#the-codex-backend)
+
 ## Watching it work
 
 The dashboard is at `http://127.0.0.1:8787/ui` — opened locally it authenticates itself,
@@ -140,14 +209,15 @@ node src/cli.ts chat     # a REPL against your own socket
 ## Tests
 
 ```bash
-npm test          # 123 tests, no API calls, no cost
+npm test          # 153 tests, no API calls, no cost
 npm run typecheck
 ```
 
-Driven by `test/fake-claude.mjs`, a stand-in speaking the same stream-json protocol —
-including the awkward parts the real CLI does, like restating a message under the same id,
-splitting a reply across text blocks, or sending a thinking block whose text has been
-redacted away to nothing.
+Driven by `test/fake-claude.mjs` and `test/fake-codex.mjs`, stand-ins speaking the same
+protocols as the real CLIs — including the awkward parts they do, like restating a message
+under the same id, splitting a reply across text blocks, sending a thinking block whose
+text has been redacted away to nothing, or exiting after every single turn and having to
+recover the conversation from a file.
 
 `test/stream-parity.test.ts` pins the one invariant that spans both dialects: the text
 deltas of a turn, reassembled, equal the authoritative reply. It cannot be proved — a CLI

@@ -3,7 +3,7 @@ import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import type { Config } from "../core/config.ts";
 import { projectRoot, resolveModel } from "../core/config.ts";
-import { SessionManager } from "../claude/sessions.ts";
+import { SessionManager } from "../agent/sessions.ts";
 import { isAuthorized } from "./auth.ts";
 import { SseWriter } from "./sse.ts";
 import { telemetry } from "../core/telemetry.ts";

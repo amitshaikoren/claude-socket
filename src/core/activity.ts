@@ -16,15 +16,22 @@ function isRecord(v: unknown): v is Record<string, unknown> {
   return typeof v === "object" && v !== null && !Array.isArray(v);
 }
 
+/** Flatten to one short line, with an ellipsis when it does not fit. */
+function oneLine(value: string): string {
+  const flat = value.replace(/\s+/g, " ").trim();
+  return flat.length > 80 ? flat.slice(0, 77) + "..." : flat;
+}
+
 /** The primary argument of a tool call, flattened to one short line. */
 export function summarizeToolInput(input: unknown): string {
+  // Codex hands tool arguments over as a string — a shell line, or the source
+  // of a call — rather than as the object the Claude CLI sends. There is no
+  // primary key to pick out of it, so the whole thing is the summary.
+  if (typeof input === "string") return oneLine(input);
   if (!isRecord(input)) return "";
   for (const key of PRIMARY_KEYS) {
     const value = input[key];
-    if (typeof value === "string" && value.trim()) {
-      const flat = value.replace(/\s+/g, " ").trim();
-      return flat.length > 80 ? flat.slice(0, 77) + "..." : flat;
-    }
+    if (typeof value === "string" && value.trim()) return oneLine(value);
   }
   const keys = Object.keys(input);
   return keys.length > 0 ? keys.join(", ") : "";

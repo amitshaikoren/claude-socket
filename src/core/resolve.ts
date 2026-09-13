@@ -6,6 +6,7 @@ import {
   emptyToolPolicy,
   isMode,
   type Mode,
+  type Provider,
   type SessionClass,
   type ToolPolicy,
 } from "./types.ts";
@@ -68,6 +69,22 @@ function resolveCwd(mode: AgentModeConfig, requested: string | null): string {
 }
 
 /**
+ * Where an oracle session runs.
+ *
+ * On Claude this barely matters: oracle spawns with `--tools ""`, so the CLI's
+ * working directory is a detail nothing can reach. On Codex it matters a great
+ * deal — the sandbox is the only lever there, and a read-only sandbox rooted
+ * wherever the bridge happens to have been started is a read-only sandbox over
+ * the bridge's own source, config file and API tokens included. So Codex gets a
+ * directory inside the workspace root like every other mode, and it is not
+ * settable per request: oracle is not supposed to be about a directory at all.
+ */
+function oracleCwd(cfg: Config, provider: Provider): string {
+  if (provider !== "codex") return process.cwd();
+  return join(resolve(cfg.semi.workspaceRoot), "oracle");
+}
+
+/**
  * Decide which of Claude Code's own tools this session may use.
  *
  * Three layers, each narrower than the last: the mode's config default, then the
@@ -81,10 +98,27 @@ function resolveCwd(mode: AgentModeConfig, requested: string | null): string {
  */
 function resolveToolPolicy(
   cfg: Config,
+  provider: Provider,
   mode: Mode,
   entry: ModelEntry,
   headers: IncomingHttpHeaders,
 ): ToolPolicy {
+  // `codex exec` has no tool allowlist — a sandbox is the only lever it takes —
+  // so a request that asks to narrow one cannot be honoured. Saying so is the
+  // only safe answer: silently ignoring it would leave a caller believing it
+  // had restricted an agent that is still holding every tool it started with.
+  if (provider === "codex") {
+    if (headerList(headers, "x-claude-tools") || headerList(headers, "x-claude-disallowed-tools")) {
+      throw new SocketError(
+        400,
+        "invalid_request_error",
+        "codex has no tool allowlist, so X-Claude-Tools cannot be applied; " +
+          `its tool access is set by the sandbox for this mode (${mode})`,
+      );
+    }
+    return emptyToolPolicy();
+  }
+
   const section = modeConfig(cfg, mode);
   if (!section) return emptyToolPolicy();
 
@@ -149,9 +183,15 @@ export function resolveTarget(
 
   const modeHeader = header(headers, "x-claude-mode");
   const mode: Mode = isMode(modeHeader) ? modeHeader : entry.mode;
+  // The catalog entry decides the backend; a header can move a request between
+  // modes but never between CLIs, because the model id would no longer mean
+  // anything to the one it landed on.
+  const provider: Provider = entry.provider;
   const effort = header(headers, "x-claude-effort") ?? entry.effort;
   const section = modeConfig(cfg, mode);
-  const cwd = section ? resolveCwd(section, header(headers, "x-claude-cwd")) : process.cwd();
+  const cwd = section
+    ? resolveCwd(section, header(headers, "x-claude-cwd"))
+    : oracleCwd(cfg, provider);
 
   const budgetHeader = header(headers, "x-claude-max-budget-usd");
   const maxBudgetUsd = budgetHeader ? Number(budgetHeader) : null;
@@ -167,13 +207,14 @@ export function resolveTarget(
   return {
     entry,
     cls: {
+      provider,
       mode,
       model: entry.model,
       systemPrompt: resolvedSystem,
       effort,
       cwd,
       jsonSchema: jsonSchema ? JSON.stringify(jsonSchema) : null,
-      tools: resolveToolPolicy(cfg, mode, entry, headers),
+      tools: resolveToolPolicy(cfg, provider, mode, entry, headers),
     },
     pinnedSession: header(headers, "x-claude-session"),
     maxBudgetUsd: Number.isFinite(maxBudgetUsd) ? maxBudgetUsd : null,

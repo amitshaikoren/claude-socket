@@ -13,7 +13,22 @@
     "env": {}
   },
 
-  "defaults": { "mode": "oracle", "model": "claude-sonnet-5", "effort": null },
+  "_codex_comment": "The second backend, for ChatGPT-plan models through the codex CLI. 'home' sets CODEX_HOME; leave it empty to use the operator's own, which is where the login lives — codex rotates its refresh token on use, so a second copy of auth.json would eventually invalidate whichever one refreshed second, including your own codex. 'ignoreUserConfig' skips your config.toml so your MCP servers, plugins and model default stay out of bridge sessions (auth still comes from CODEX_HOME regardless); the one thing it discards that gets put back automatically is the Windows [windows] sandbox setup, without which every command the agent runs is silently refused. 'sandbox' is codex's only tool lever — there is no allowlist, which is why X-Claude-Tools is rejected rather than ignored for these models. 'reasoningSummary' detailed is what makes the thinking channel carry text; unlike the Claude CLI, codex actually fills it in. 'readRollout' reads per-model-call usage back out of the session transcript under CODEX_HOME/sessions; off falls back to one step per turn and loses per-tool-call attribution.",
+  "codex": {
+    "binary": "codex",
+    "binaryArgs": [],
+    "extraArgs": [],
+    "env": {},
+    "home": "",
+    "ignoreUserConfig": true,
+    "configOverrides": {},
+    "reasoningSummary": "detailed",
+    "sandbox": { "oracle": "read-only", "semi": "read-only", "harness": "workspace-write" },
+    "readRollout": true
+  },
+
+  "_defaults_comment": "'provider' decides which CLI answers for the bare mode aliases (oracle/harness/semi) and for a model id the catalog does not know. A model id that names a known model still goes to that model's own backend.",
+  "defaults": { "provider": "claude", "mode": "oracle", "model": "claude-sonnet-5", "effort": null },
 
   "_oracle_comment": "A bare completion endpoint: the caller owns the tool loop. 'activity' governs the model's thinking, which the CLI emits here whether or not anyone reads it — 'reasoning' puts it on the side channel (reasoning_content, or a thinking block on the Anthropic dialect), 'off' discards it. Set 'content' only if you want the thinking merged into the reply text itself; a client that cites or grounds the reply will read it as assertions.",
   "oracle": {
@@ -77,14 +92,24 @@
 
   "logLevel": "info",
 
-  "_models_comment": "Optional. Omit to use the default catalog. Rename 'id' freely: it is what clients see, while 'model' is what the CLI is told. A 'semi' or 'harness' entry may carry its own 'tools' list, overriding the mode's default, so one catalog can offer several differently-privileged agents.",
+  "_models_comment": "Optional. Omit to use the default catalog. Rename 'id' freely: it is what clients see, while 'model' is what the CLI is told. 'provider' says which CLI answers; omit it and it is inferred from the model name, so an older config file keeps working. A 'semi' or 'harness' entry may carry its own 'tools' list, overriding the mode's default, so one catalog can offer several differently-privileged agents — but only for claude, since codex has no tool allowlist to narrow.",
   "_models_example": [
     {
       "id": "hermes-70b-local",
+      "provider": "claude",
       "model": "claude-sonnet-5",
       "mode": "oracle",
       "effort": null,
       "contextWindow": 128000,
+      "ownedBy": "local-inference"
+    },
+    {
+      "id": "hermes-70b-thinker",
+      "provider": "codex",
+      "model": "gpt-5.6-sol",
+      "mode": "oracle",
+      "effort": "high",
+      "contextWindow": 272000,
       "ownedBy": "local-inference"
     },
     {
